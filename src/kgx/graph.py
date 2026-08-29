@@ -336,13 +336,15 @@ def build_graph(
     ontology: Ontology | None = None,
     *,
     pin: Mapping[str, str] | None = None,
+    pin_names: Mapping[str, str] | None = None,
     snippet_width: int = 110,
     drop_self_loops: bool = True,
 ) -> KnowledgeGraph:
     """Rewrite endpoints to canonical ids and collapse duplicate edges.
 
     ``pin`` force-maps specific mention ids to a canonical id, overriding the
-    resolver. That is how the assistant's own user gets to be one node
+    resolver; ``pin_names`` optionally supplies the display name for those ids
+    (a gazetteer knows the canonical name, the mentions only know surfaces). That is how the assistant's own user gets to be one node
     (:data:`kgx.coref.USER_CANON_ID`) regardless of how the first-person
     substitution phrased it in any given turn.
 
@@ -364,11 +366,36 @@ def build_graph(
             base = next((entities[s] for s in sources if s in entities), None)
             existing = entities.get(target_id)
             anchor = existing or base
+
+            # A pin can name mentions the resolver never clustered -- gazetteer
+            # linking does exactly that, since a linked mention is removed from
+            # the similarity path entirely. Take the type from the pinned
+            # mentions themselves rather than defaulting to a placeholder, or
+            # every dictionary-linked node arrives typed "user".
+            if anchor is not None:
+                merged_type, merged_name = anchor.type, anchor.canonical
+            else:
+                pinned_mentions = [m for dg in doc_graphs for m in dg.mentions
+                                   if m.mention_id in members]
+                if pinned_mentions:
+                    merged_type = Counter(m.type for m in pinned_mentions).most_common(1)[0][0]
+                    merged_name = max(pinned_mentions, key=lambda m: (len(m.text), m.confidence)).text
+                else:
+                    merged_type, merged_name = "entity", target_id.split(":")[-1]
+
             merged = CanonicalEntity(
                 canon_id=target_id,
-                type=anchor.type if anchor else "user",
-                canonical=anchor.canonical if anchor else target_id.split(":")[-1],
+                type=merged_type,
+                canonical=(pin_names or {}).get(target_id, merged_name),
             )
+            if anchor is None:
+                # carry every pinned surface as an alias so the node is findable
+                merged.aliases = sorted({m.text.strip() for m in
+                                         (m for dg in doc_graphs for m in dg.mentions
+                                          if m.mention_id in members)} - {merged.canonical})
+                merged.mentions = sorted(members)
+                merged.docs = sorted({m.doc_id for dg in doc_graphs for m in dg.mentions
+                                      if m.mention_id in members})
             if existing is not None:
                 # Pinning onto an id that already exists must fold into it rather
                 # than replace it, or the pin silently deletes an entity.

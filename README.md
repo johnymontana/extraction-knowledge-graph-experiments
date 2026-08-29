@@ -18,10 +18,11 @@ joint entity *and* relation extraction against a schema supplied at runtime, on 
 | **[06](notebooks/06_finetuning_distillation.ipynb)** | **Distillation** — LLM labels fine-tuned into a 74M encoder, and whether that pays | `claude` CLI |
 | **[07](notebooks/07_kg_framework_comparison.ipynb)** | **Frameworks compared** — SimpleKGPipeline, LLMGraphTransformer, PropertyGraphIndex on one corpus | Neo4j, `claude` CLI |
 | **[08](notebooks/08_coreference.ipynb)** | **Coreference** — four neural engines against the deterministic rules | — |
+| **[09](notebooks/09_three_domains.ipynb)** | **Three domains, no LLM** — travel, customer service and ecommerce end to end, with gazetteer linking and NVL | Neo4j |
 
 No API key anywhere. Notebooks 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
 Claude Code) through `kgx.llm.ClaudeCLI`, which caches every response to disk — a re-run is free and
-byte-identical.
+byte-identical. **Notebook 09 uses no LLM at all**, by design.
 
 ---
 
@@ -70,6 +71,8 @@ ontology  →  extract  →  [coref]  →  resolve  →  graph  →  [temporal]
 | `kgx.evaluate` | Triple-level P/R/F1 with an explicit, auditable matching policy. |
 | `kgx.baselines` | spaCy as the closed-vocabulary floor, with the ontology-coverage gap made explicit. |
 | `kgx.frameworks` | Adapters so LangChain / LlamaIndex / graphrag can run on a subprocess-backed LLM. |
+| `kgx.gazetteer` | Dictionary linking against a controlled vocabulary — stable ids, not clusters. |
+| `kgx.domains` | Travel, customer-service and shopping ontologies. |
 
 Two ontologies ship: `kgx.AGENT_MEMORY` (13 node labels, 16 edge types) and `kgx.BUSINESS_NEWS` (13 / 15).
 Both are ordinary data — write your own in Python, JSON, or YAML.
@@ -147,6 +150,8 @@ src/kgx/            the library
   evaluate.py       triple scoring against gold
   baselines.py      spaCy closed-vocab baseline
   frameworks.py     LangChain / LlamaIndex / graphrag adapters
+  gazetteer.py      controlled-vocabulary entity linking
+  domains.py        travel / customer service / shopping ontologies
   data/             synthetic corpora with gold labels
 notebooks/          01-08, see the table above
 docs/LANDSCAPE.md   survey of the alternatives at every stage
@@ -221,6 +226,27 @@ with zero LLM calls, recovered ~96% of the gap between strict and alias-tolerant
 
 **Each NVL `render()` inlines an ~8.5 MB bundle**, and `from_neo4j` copies every property — including your
 384-float embeddings — into it. Strip them in Python; a map projection does not help.
+
+**"Precision 1.000" was a property of the corpus, not the resolver** (notebook 09). Notebooks 01 and 05 both
+report perfect B-cubed precision on business news. Given an ecommerce corpus where `Aurora 14` and
+`Aurora 14 Pro` are different products, the same code at the same threshold merges them — along with
+`N600`/`N600X` and `Halcyon Buds`/`Halcyon Buds Pro`. The distinguishing token is exactly the kind of short
+suffix normalisation is built to ignore.
+
+**Where a controlled vocabulary exists, stop computing similarity.** A gazetteer links `LHR` to
+`London Heathrow` exactly, where Jaro-Winkler scores 0.45 and no threshold reaches it — and it yields a
+*stable id* that survives a rerun and a change of corpus, which clustering cannot. But validate any type
+constraint you put on it: matching the extractor's type against the vocabulary's kind cost 20 points of
+coverage and prevented zero errors, because both sides reasonably disagreed about whether an airport is a place.
+
+**Document-level judgement is the boundary of the no-LLM position.** GLiNER2.5 classified support-ticket
+intent near chance and priority *at* chance — a near-constant predictor emitting `high` for seven of eight
+threads at 0.75–1.00 confidence. Intent is written down; severity is not, so a span model has nothing to key
+on. Of every task in notebook 09, that is the one worth escalating.
+
+**An ontology is a hypothesis about the text.** `replaces` fires at 0.99 on agent memory ("I've switched to
+pnpm" — one clause, two named tools, an explicit verb) and never fires on support threads, where the same
+supersession is spread across a four-turn negotiation. Same relation, same model, different discourse shape.
 
 ## Notes
 

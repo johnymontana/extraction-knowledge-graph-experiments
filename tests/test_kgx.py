@@ -1544,3 +1544,104 @@ def test_llm_extractor_recovers_character_offsets():
 
     (mention,) = doc.mentions
     assert text[mention.start:mention.end] == "Acme Corp"
+
+
+# ---------------------------------------------------------------------------
+# kgx.gazetteer -- dictionary linking against a controlled vocabulary
+# ---------------------------------------------------------------------------
+
+
+def _airports():
+    from kgx.gazetteer import Gazetteer
+
+    return Gazetteer({
+        "LHR": {"name": "London Heathrow", "kind": "airport", "aliases": ["Heathrow"]},
+        "JFK": {"name": "John F. Kennedy International", "kind": "airport",
+                "aliases": ["New York JFK", "JFK Airport"]},
+        "MR": {"name": "Meridian Air", "kind": "airline", "aliases": ["Meridian"]},
+    })
+
+
+def test_gazetteer_resolves_a_code_no_string_metric_could_reach():
+    """LHR vs London Heathrow is Jaro-Winkler 0.48; the dictionary makes it exact."""
+    gz = _airports()
+
+    assert gz.lookup("LHR") == ("LHR", "code", 1.0)
+    assert gz.lookup("London Heathrow")[:2] == ("LHR", "name")
+    assert gz.lookup("Heathrow")[:2] == ("LHR", "alias")
+
+
+def test_gazetteer_reads_the_parenthetical_code_convention():
+    gz = _airports()
+    assert gz.lookup("London Heathrow (LHR)") == ("LHR", "code", 1.0)
+
+
+def test_a_miss_is_a_miss_by_default():
+    """Silently snapping an unknown code to the nearest known one destroys the signal."""
+    gz = _airports()
+
+    assert gz.lookup("Gatwick") is None
+    assert gz.lookup("Heathrw") is None                      # fuzzy off by default
+    assert gz.lookup("Heathrw", fuzzy=0.85)[:2] == ("LHR", "fuzzy")
+
+
+def test_kind_constraint_stops_a_cross_category_link():
+    """A city mention must not link to an airline that shares a name."""
+    from kgx.extract import Mention
+
+    gz = _airports()
+    mentions = [Mention("d:1", "d", "city", "Meridian", 0, 8)]
+
+    unconstrained, _ = gz.resolve(mentions, types=["city"])
+    constrained, missed = gz.resolve(mentions, types=["city"], kinds={"city": "airport"})
+
+    assert unconstrained[0].key == "MR"
+    assert constrained == [] and len(missed) == 1
+
+
+def test_resolve_splits_matched_from_unmatched_and_records_the_rule():
+    from kgx.extract import Mention
+
+    gz = _airports()
+    mentions = [
+        Mention("d:1", "d", "airport", "LHR", 0, 3),
+        Mention("d:2", "d", "airport", "Heathrow", 0, 8),
+        Mention("d:3", "d", "airport", "Gatwick", 0, 7),
+        Mention("d:4", "d", "disruption", "LHR", 0, 3),      # excluded by `types`
+    ]
+
+    matched, unmatched = gz.resolve(mentions, types=["airport"])
+
+    assert {m.mention_id: m.how for m in matched} == {"d:1": "code", "d:2": "alias"}
+    assert [m.mention_id for m in unmatched] == ["d:3", "d:4"]
+    assert all(m.key == "LHR" for m in matched)
+
+
+def test_canonical_map_gives_corpus_stable_ids():
+    """Ids come from the vocabulary key, not from a cluster, so they survive a rerun."""
+    from kgx.extract import Mention
+
+    gz = _airports()
+    matched, _ = gz.resolve(
+        [Mention("d:1", "d", "airport", "LHR", 0, 3),
+         Mention("d:2", "d", "airport", "London Heathrow", 0, 15)],
+        types=["airport"])
+
+    assert gz.canonical_map(matched, prefix="airport:") == {
+        "d:1": "airport:LHR", "d:2": "airport:LHR",
+    }
+
+
+def test_coverage_reports_what_the_vocabulary_could_not_account_for():
+    from kgx.extract import Mention
+
+    gz = _airports()
+    report = gz.coverage(
+        [Mention("d:1", "d", "airport", "LHR", 0, 3),
+         Mention("d:2", "d", "airport", "Gatwick", 0, 7)],
+        types=["airport"])
+
+    assert report["linked"] == 1
+    assert report["coverage"] == 0.5
+    assert report["by_rule"] == {"code": 1}
+    assert report["unlinked_surfaces"] == ["Gatwick"]
