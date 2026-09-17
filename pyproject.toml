@@ -28,6 +28,7 @@ dependencies = [
     "fastcoref>=2.1.6",
     "stanza>=1.14.0",
     "peft>=0.20.0",
+    "typesafe-sdk>=0.6.0",   # notebook 10 only; needs TYPESAFE_API_KEY
 ]
 
 [project.optional-dependencies]
