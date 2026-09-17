@@ -19,14 +19,18 @@ joint entity *and* relation extraction against a schema supplied at runtime, on 
 | **[07](notebooks/07_kg_framework_comparison.ipynb)** | **Frameworks compared** — SimpleKGPipeline, LLMGraphTransformer, PropertyGraphIndex on one corpus | Neo4j, `claude` CLI |
 | **[08](notebooks/08_coreference.ipynb)** | **Coreference** — four neural engines against the deterministic rules | — |
 | **[09](notebooks/09_three_domains.ipynb)** | **Three domains, no LLM** — travel, customer service and ecommerce end to end, with gazetteer linking and NVL | Neo4j |
-| **[10](notebooks/10_typesafe_system_one.ipynb)** | **Typed judgments** — TypeSafe System One for assertion gating, review-band adjudication, and judgments as graph data | `TYPESAFE_API_KEY` |
+| **[10](notebooks/10_typesafe_system_one.ipynb)** | **Typed judgments** — TypeSafe System One for assertion gating, review-band adjudication, typing before blocking, a must-not-merge test, and judgments as graph data | `TYPESAFE_API_KEY` |
+| **[11](notebooks/11_typesafe_relation_selection.ipynb)** | **Selection, not generation** — relation extraction as one `Choice` per enumerated entity pair, scored against joint decoding; the recall experiment | `TYPESAFE_API_KEY` |
+| **[12](notebooks/12_typesafe_contradictions.ipynb)** | **What contradicts what** — a `Noul` as the temporal layer's `alternative_fn`, against embeddings and `replaces` edges, on the planted switches | `TYPESAFE_API_KEY` |
+| **[13](notebooks/13_typesafe_cascade.ipynb)** | **Escalate on confidence** — the uncertain edge judgments and `review` pairs sent to Claude Haiku, swept from 0% to 100%, with cost | `TYPESAFE_API_KEY`, `claude` CLI |
+| **[14](notebooks/14_typesafe_document_judgments.ipynb)** | **The boundary of the no-LLM position** — intent, priority and resolution for the eight support threads, as three questions and then as graph properties | `TYPESAFE_API_KEY` |
 
 Notebooks 01–09 need no API key. 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
 Claude Code) through `kgx.llm.ClaudeCLI`; **notebook 09 uses no LLM at all**, by design.
 
-**Notebook 10 is the exception** and needs a hosted API key, `TYPESAFE_API_KEY`. It is kept separate for
-that reason: `kgx.typesafe` is not exported from `kgx`, so importing it is a deliberate act and nothing
-else in the repo acquires the dependency. Like `kgx.llm.ClaudeCLI`, it caches every response to disk
+**Notebooks 10–14 are the exception** and need a hosted API key, `TYPESAFE_API_KEY` (13 also needs the
+`claude` CLI). They are kept separate for that reason: `kgx.typesafe` is not exported from `kgx`, so
+importing it is a deliberate act and nothing else in the repo acquires the dependency. Like `kgx.llm.ClaudeCLI`, it caches every response to disk
 content-addressed on `(model, state, questions)` — a re-run is free, byte-identical, and needs no key.
 
 ---
@@ -39,7 +43,7 @@ uv run jupyter lab notebooks/01_gliner25_knowledge_graphs.ipynb
 ```
 
 First run downloads ~400 MB (GLiNER2.5-base) plus ~90 MB (MiniLM, for entity resolution). Everything after
-that is local; the only hosted dependency in the repo is notebook 10's.
+that is local; the only hosted dependency in the repo is notebooks 10–14's.
 
 ```python
 import kgx
@@ -73,7 +77,7 @@ ontology  →  extract  →  [coref]  →  resolve  →  graph  →  [temporal]
 | `kgx.temporal` | Bi-temporal fact store — supersede contradictions instead of accumulating them. |
 | `kgx.neo4j_io` | Idempotent loading into Neo4j via `$()` dynamic labels, with schema introspection. |
 | `kgx.llm` | The `claude` CLI as a cached LLM backend, plus an `LLMExtractor` that returns the same `DocGraph` as GLiNER. |
-| `kgx.typesafe` | TypeSafe System One as a pipeline stage — a disk-cached client, assertion gating on extracted edges, and adjudication of the resolution review band. The one module that needs a hosted API key. |
+| `kgx.typesafe` | TypeSafe System One as a pipeline stage — a disk-cached client; assertion gating, pair adjudication, referent typing and soft blocking, relation selection over enumerated pairs, and an `alternative_fn` for the temporal layer. The one module that needs a hosted API key. |
 | `kgx.evaluate` | Triple-level P/R/F1 with an explicit, auditable matching policy. |
 | `kgx.baselines` | spaCy as the closed-vocabulary floor, with the ontology-coverage gap made explicit. |
 | `kgx.frameworks` | Adapters so LangChain / LlamaIndex / graphrag can run on a subprocess-backed LLM. |
@@ -160,7 +164,7 @@ src/kgx/            the library
   gazetteer.py      controlled-vocabulary entity linking
   domains.py        travel / customer service / shopping ontologies
   data/             synthetic corpora with gold labels
-notebooks/          01-10, see the table above
+notebooks/          01-14, see the table above
 docs/LANDSCAPE.md   survey of the alternatives at every stage
 output/             generated graphs, Cypher, CSVs (gitignored)
 ```
@@ -287,9 +291,68 @@ reaches **B-cubed F1 1.000 at precision 1.000** — where notebook 05's best con
 the opposite direction. The type constraint in notebook 09's gazetteer cost 20 points of coverage; here it
 cost the entire remaining recall gap.
 
+**The type wall comes down when blocking reads the distribution, not the label.** Re-typing every mention
+by *referent* against the ontology's own descriptions agrees with GLiNER on 192 of 214 and moves recall
+0.897 → 0.914 — but `HLCN` stays `security` at 0.56, `company` at 0.41, because the ontology defines a
+ticker as a security and the model reports that ambiguity faithfully. Cloning each ambiguous mention into
+every type block with ≥ 25% of the mass (17 clones) takes the *unchanged* resolver to B-cubed 1.000 at
+precision 1.000 — no pairs hand-fed, no scoring rule touched. A `Choice` at 0.56/0.41 is a request to be
+allowed both readings; type-scoped blocking that reads only the label makes a wall of it.
+
+**It refuses, too.** On the shopping corpus's must-not-merge pairs (`Aurora 14` / `Aurora 14 Pro`,
+`N600` / `N600X`) the repo's resolver merges three of twelve; the adjudicator merges none, while holding
+every must-merge pair — zero false merges, zero false rejects. Putting the shopping ontology's own rule
+(*"'Aurora 14' and 'Aurora 14 Pro' are two products, not one"*) into the question turns its one hedge
+into `reject` at ≤ 0.06, at the cost of moving one cross-type must-merge pair from `merge` to `review`.
+Nothing wrong, something curated.
+
 **`pair_completeness` is not a ceiling on B-cubed recall.** 0.879 against a baseline recall of 0.897 and a
 recovered recall of 1.000. Clustering is transitive, so it unites pairs blocking never proposed. What it
 bounds is what an adjudicator can be *asked* about — which is the constraint that actually bit.
+
+**Selection over enumerated pairs is the best relation extractor measured here — but only combined and
+confidence-filtered** (notebook 11). Given GLiNER's entities, code enumerates every ontology-legal ordered pair
+in a document and one `Choice` picks the relation or `none`. Alone it is not a better extractor: the same
+recall as joint decoding at half the precision, because `none` (rightly) takes 64–71% of candidates and the
+residue includes low-probability picks of the ontology's most permissive relation. But the two find
+*different* things — six gold triples each that the other misses at paragraph scope — and at document scope
+selection reaches recall 0.596, the highest on this corpus. Kept at `p ≥ 0.95`, gated, and unioned with
+GLiNER's gated edges: **F1 0.442**, against 0.404 for notebook 10's best. Three high-confidence relabels of
+GLiNER edges are all gold-correct.
+
+**130 of GLiNER's 170 edges cross a paragraph.** The first draft of notebook 11 asserted zero, from a probe
+with a precedence bug; the notebook's own check said 130 and reframed the experiment. Paragraph-scoped
+candidate enumeration is a handicap, document scope is the fair comparison, and it costs 3× the requests.
+Measure the scope.
+
+**Whether two things are alternatives is a world-knowledge question, and one `Noul` answers it where
+similarity cannot** (notebook 12). Over every pair of the things the agent-memory gold facts name, *are `a`
+and `b` alternatives?* puts the two planted switches at 0.92 (`npm`/`pnpm`) and 0.63 (`Python`/`Go`) and
+all 26 other pairs at ≤ 0.21. MiniLM cosine puts `Python`/`Go` at 0.166 — below most non-alternatives —
+because it measures how alike two names are, and competing for the same role is not that. Plugged in as
+`TemporalGraph(alternative_fn=JevAlternatives(ts))`, it is the whole integration.
+
+**In the pipeline it never got to show it.** Four different `alternative_fn`s produced identical
+supersessions, because extraction delivered exactly one real switch (`uses_tool npm → pnpm`) and even
+embeddings cleared 0.55 on it, by 0.018. `Go` was never extracted; `prefers pnpm` was extracted a session
+before the user switched. The judge is only as good as its queue — the third stage in a row to say so.
+
+**Escalating the fast judge's uncertain calls to Claude Haiku bought nothing, and the sweep proves it**
+(notebook 13). F1 0.404 with the System One gate; 0.400 sending its 31 least-confident edge judgments to
+Haiku; 0.388 sending all 170 — recall identical throughout, precision falling as escalation rises, no width
+of the band at which the slow judge helps. Haiku agreed with System One on 28 of the 31; the three flips
+were a coin-flip acquisition the source itself hedges, and one spurious edge Haiku asserted. On the fourteen
+`review` pairs, Haiku got **none** of the six gold-same right (*"different legal names"*), where the
+adjudicator had calibratedly declined to decide. A larger model is not a curator. 20× the latency, $0.12.
+
+**What is written down, the model reads; what is a definition, it has to be given** (notebook 14). On the
+eight support threads where GLiNER classified priority at chance, a `Noul` on *is this resolved* — which is
+in the customer's last turn — scores 8 of 8 with a clean gap (open 0.05–0.08, resolved 0.64–0.97). Intent
+goes from 3 of 8 to 5 of 8; the three misses are the question reading the thread's end (*"Do it"* on a
+refund) where the gold reads its opening ask. Priority stays at 3 of 8 with the misses *confident*, because
+the `Score` levels were the notebook's and the gold's scale was never shown to it. Confidence routing sent
+the three hedged calls to a person and let every confident disagreement through — it routes model
+uncertainty, not definitional disagreement. Fix the question, not the threshold.
 
 **Batching is a property of the state, not a flag.** 627 questions in 98 requests at ~180 ms each; edge
 gating alone was 340 questions in 35, because one request carries a dozen edges over one shared document.

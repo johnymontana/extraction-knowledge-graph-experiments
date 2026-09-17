@@ -14,6 +14,7 @@ instead of silently billing someone.
 from __future__ import annotations
 
 import json
+import os
 
 import msgspec
 import pytest
@@ -25,18 +26,33 @@ from kgx.resolve import CanonicalEntity, Resolution, ScoredPair
 from kgx.typesafe import (
     ASSERTION_LEVELS,
     LINK_LEVELS,
+    NO_RELATION,
     CachedTypeSafe,
     EdgeJudgment,
+    JevAlternatives,
     PairVerdict,
+    RelationPick,
     TypeSafeUnavailable,
+    TypeVerdict,
     adjudicate_pairs,
+    alternatives_questions,
+    apply_types,
     apply_verdicts,
+    candidate_pairs,
     edge_questions,
+    fold_clones,
     judge_edges,
     judge_sentences,
+    legal_relations,
     pair_questions,
     pair_state,
+    picks_to_graphs,
+    relation_questions,
+    retype_mentions,
+    select_relations,
     sentence_questions,
+    soft_typed,
+    type_questions,
 )
 
 
@@ -89,6 +105,34 @@ def mention(mention_id, type_, text, *, doc_id="d1", start=0, context=""):
 def test_unavailable_without_key_or_cache(client):
     with pytest.raises(TypeSafeUnavailable, match="TYPESAFE_API_KEY"):
         client.ask("hello", {"q": ts.Noul(instructions="Is this a greeting?")})
+
+
+def _shown_cache_dir(client):
+    shown = repr(client)
+    assert "cache_dir=" in shown and "key=unset" in shown
+    return shown.split("cache_dir=")[1].split(",")[0].strip("'")
+
+
+def test_repr_shows_a_relative_cache_path(client, tmp_path):
+    """A notebook prints this; it must not bake an absolute home path into an output."""
+    import os
+    from pathlib import Path
+
+    inner = _shown_cache_dir(client)
+    assert not os.path.isabs(inner)
+    assert Path(inner).resolve() == tmp_path.resolve()
+
+
+def test_repr_from_a_sibling_directory_is_the_notebook_case(tmp_path, monkeypatch):
+    """cwd = notebooks/, cache = ../output/typesafe_cache: no absolute prefix at all."""
+    cache = tmp_path / "output" / "typesafe_cache"
+    here = tmp_path / "notebooks"
+    here.mkdir()
+    monkeypatch.chdir(here)
+
+    inner = _shown_cache_dir(CachedTypeSafe(cache_dir=cache))
+    assert inner == os.path.join("..", "output", "typesafe_cache")
+    assert str(tmp_path) not in inner
 
 
 def test_check_without_key_names_the_env_var(client):
@@ -492,3 +536,287 @@ def test_apply_verdicts_keeps_untouched_mentions():
     resolution = _resolution({"m0": "c0", "m1": "c0", "m2": "c2"})
     merged = apply_verdicts(resolution, [])
     assert merged == {"m0": "c0", "m1": "c0", "m2": "c2"}
+
+
+# ---------------------------------------------------------------------------
+# guided pair questions
+# ---------------------------------------------------------------------------
+
+
+def test_pair_questions_without_a_guideline_are_unchanged():
+    """Cache compatibility: no description means the exact old wire form."""
+    wire = json.loads(msgspec.json.encode(pair_questions("company")))
+    assert "In this domain" not in wire["link_state"]["instructions"]
+    assert wire == json.loads(msgspec.json.encode(pair_questions("company", "")))
+
+
+def test_pair_questions_carry_the_ontology_guideline():
+    desc = BUSINESS_NEWS.entity("security").description
+    wire = json.loads(msgspec.json.encode(pair_questions("security", desc)))
+    assert f"In this domain, a security is: {desc}" in wire["link_state"]["instructions"]
+    # The diagnostics are unaffected.
+    assert wire["same_name"] == json.loads(msgspec.json.encode(pair_questions("security")))["same_name"]
+
+
+def test_adjudicate_pairs_passes_both_descriptions_for_a_cross_type_pair(client, monkeypatch):
+    mentions = {"m0": mention("m0", "security", "HLCN", context="shares of HLCN"),
+                "m1": mention("m1", "company", "Halcyon", context="Halcyon reported")}
+    pairs = [ScoredPair(a="m0", b="m1", type="security or company", block="never", score=0.0)]
+    seen = {}
+
+    def fake_ask(state, questions, *, refresh=False):
+        seen["instr"] = questions["link_state"].instructions
+        return ts.SystemOneResponse(
+            model="m", usage=ts.Usage(),
+            answers={"link_state": ts.ScoreAnswer(score=1.9, confidence=0.9, legend={},
+                                                  probabilities={}),
+                     "same_name": ts.NoulAnswer(noul=0.5),
+                     "same_context": ts.NoulAnswer(noul=0.5),
+                     "abbreviation": ts.NoulAnswer(noul=0.9)})
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    adjudicate_pairs(client, pairs, mentions, ontology=BUSINESS_NEWS)
+    assert BUSINESS_NEWS.entity("security").description in seen["instr"]
+    assert BUSINESS_NEWS.entity("company").description in seen["instr"]
+
+
+# ---------------------------------------------------------------------------
+# re-typing
+# ---------------------------------------------------------------------------
+
+
+def test_type_questions_use_the_ontology_descriptions_as_criteria():
+    wire = json.loads(msgspec.json.encode(type_questions("HLCN", BUSINESS_NEWS)))["type"]
+    assert wire["type"] == "choice"
+    assert wire["criteria"] == {e.name: e.description for e in BUSINESS_NEWS.entities}
+    assert "HLCN" in wire["instructions"] and "stand for" in wire["instructions"]
+
+
+def _typed_graph():
+    ms = [mention("m0", "security", "HLCN", context="a"),
+          mention("m1", "company", "Halcyon", context="b"),
+          mention("m2", "security", "HLCN", context="c")]      # same surface as m0
+    return DocGraph(doc_id="d1", text="HLCN and Halcyon and HLCN.", mentions=ms)
+
+
+def test_retype_mentions_dedupes_surfaces_and_fans_the_answer_out(client, monkeypatch):
+    seen = []
+
+    def fake_ask(state, questions, *, refresh=False):
+        seen.append(sorted(questions))
+        return ts.SystemOneResponse(
+            model="m", usage=ts.Usage(),
+            answers={"s0": ts.ChoiceAnswer(choice="security", confidence=0.6,
+                                           probabilities={"security": 0.6, "company": 0.4}),
+                     "s1": ts.ChoiceAnswer(choice="company", confidence=1.0,
+                                           probabilities={"company": 1.0})})
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    verdicts = retype_mentions(client, [_typed_graph()], BUSINESS_NEWS)
+
+    assert seen == [["s0", "s1"]]                       # two surfaces, one request
+    assert [v.mention_id for v in verdicts] == ["m0", "m2", "m1"]
+    assert verdicts[0].alternatives(0.25) == ["company"]
+    assert verdicts[1].probabilities == verdicts[0].probabilities   # copied to m2
+    assert not any(v.changed for v in verdicts)
+
+
+def test_retype_mentions_chunks_at_max_questions(client, monkeypatch):
+    ms = [mention(f"m{i}", "company", f"Co{i}") for i in range(5)]
+    graph = DocGraph(doc_id="d1", text="x", mentions=ms)
+    sizes = []
+
+    def fake_ask(state, questions, *, refresh=False):
+        sizes.append(len(questions))
+        return ts.SystemOneResponse(
+            model="m", usage=ts.Usage(),
+            answers={k: ts.ChoiceAnswer(choice="company", confidence=1.0, probabilities={})
+                     for k in questions})
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    assert len(retype_mentions(client, [graph], BUSINESS_NEWS, max_questions=2)) == 5
+    assert sizes == [2, 2, 1]
+
+
+def _type_verdict(mid, old, new, probs):
+    return TypeVerdict(mention_id=mid, doc_id="d1", text=mid, extractor_type=old, type=new,
+                       confidence=max(probs.values()), probabilities=probs)
+
+
+def test_apply_types_swaps_the_argmax_in_and_keeps_ids():
+    ms = [mention("m0", "security", "HLCN"), mention("m1", "company", "Halcyon")]
+    out = apply_types(ms, [_type_verdict("m0", "security", "company", {"company": 0.9})])
+    assert [(m.mention_id, m.type) for m in out] == [("m0", "company"), ("m1", "company")]
+    assert out[0].text == "HLCN"
+
+
+def test_soft_typed_clones_only_alternatives_with_mass():
+    ms = [mention("m0", "security", "HLCN"), mention("m1", "company", "Halcyon")]
+    verdicts = [_type_verdict("m0", "security", "security", {"security": 0.6, "company": 0.4}),
+                _type_verdict("m1", "company", "company", {"company": 0.99, "person": 0.01})]
+    out, clones = soft_typed(ms, verdicts, min_prob=0.25)
+
+    assert [(m.mention_id, m.type) for m in out] == [
+        ("m0", "security"), ("m0~company", "company"), ("m1", "company")]
+    assert clones == {"m0~company": "m0"}
+
+
+def test_fold_clones_unites_the_original_with_wherever_its_clone_landed():
+    # m0 (security) sat alone; its company clone was clustered with m1.
+    mapping = {"m0": "c-sec", "m0~company": "c-halcyon", "m1": "c-halcyon"}
+    folded = fold_clones(mapping, {"m0~company": "m0"})
+    assert set(folded) == {"m0", "m1"}                   # clones are gone
+    assert folded["m0"] == folded["m1"]
+
+
+def test_fold_clones_is_a_no_op_without_clones():
+    mapping = {"m0": "c0", "m1": "c1"}
+    assert fold_clones(mapping, {}) == mapping
+
+
+# ---------------------------------------------------------------------------
+# relation selection
+# ---------------------------------------------------------------------------
+
+
+def test_legal_relations_follow_the_ontology():
+    legal = legal_relations(BUSINESS_NEWS)
+    names = {r.name for r in legal[("company", "company")]}
+    assert {"acquires", "subsidiary_of", "supplies", "partners_with", "competes_with"} <= names
+    assert ("person", "company") in legal and ("geography", "company") not in legal
+
+
+def _pair_graph():
+    text = "Northwind acquires Cascade.\n\nPriya Raman runs Northwind. Diesel rose."
+    ms = [mention("m0", "company", "Northwind", start=0),
+          mention("m1", "company", "Cascade", start=19),
+          mention("m2", "person", "Priya Raman", start=29),
+          mention("m3", "company", "Northwind", start=46),
+          mention("m4", "commodity", "Diesel", start=57)]
+    return DocGraph(doc_id="d1", text=text, mentions=ms)
+
+
+def test_candidate_pairs_respect_scope_legality_and_dedupe():
+    g = _pair_graph()
+    para = {(a.text, b.text) for a, b in candidate_pairs(g, BUSINESS_NEWS, scope="paragraph")}
+    # Same paragraph, legal both ways.
+    assert ("Northwind", "Cascade") in para and ("Cascade", "Northwind") in para
+    # Person -> company is legal (officer_of); company -> person is not.
+    assert ("Priya Raman", "Northwind") in para and ("Northwind", "Priya Raman") not in para
+    # Cross-paragraph pairs are excluded at paragraph scope ...
+    assert ("Priya Raman", "Cascade") not in para
+    # ... and included at document scope.
+    doc = {(a.text, b.text) for a, b in candidate_pairs(g, BUSINESS_NEWS, scope="document")}
+    assert ("Priya Raman", "Cascade") in doc
+    # Diesel -> Northwind is legal (supplies); no pair is repeated.
+    assert ("Diesel", "Northwind") in doc
+    allpairs = [(a.text, b.text) for a, b in candidate_pairs(g, BUSINESS_NEWS, scope="document")]
+    assert len(allpairs) == len(set(allpairs))
+    # A surface paired with itself is never a candidate.
+    assert ("Northwind", "Northwind") not in doc
+
+
+def test_relation_questions_always_offer_none():
+    legal = legal_relations(BUSINESS_NEWS)
+    wire = json.loads(msgspec.json.encode(
+        relation_questions("Northwind", "Cascade", legal[("company", "company")])))["relation"]
+    assert wire["type"] == "choice"
+    assert NO_RELATION in wire["criteria"]
+    assert wire["criteria"]["acquires"] == BUSINESS_NEWS.relation("acquires").description
+    assert "Northwind" in wire["instructions"] and "Cascade" in wire["instructions"]
+
+
+def test_select_relations_batches_per_document_and_builds_edges(client, monkeypatch):
+    g = _pair_graph()
+    seen = []
+
+    def fake_ask(state, questions, *, refresh=False):
+        seen.append(len(questions))
+        answers = {}
+        for key, q in questions.items():
+            labels = list(q.criteria)
+            pick = "acquires" if "acquires" in labels and "Northwind" in q.instructions.split("to")[0] \
+                else NO_RELATION
+            probs = {l: 0.0 for l in labels}; probs[pick] = 0.9
+            answers[key] = ts.ChoiceAnswer(choice=pick, confidence=0.9, probabilities=probs)
+        return ts.SystemOneResponse(model="m", usage=ts.Usage(), answers=answers)
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    picks = select_relations(client, [g], BUSINESS_NEWS, scope="document", max_questions=3)
+
+    n_pairs = len(candidate_pairs(g, BUSINESS_NEWS, scope="document"))
+    assert sum(seen) == n_pairs and all(s <= 3 for s in seen)
+    assert len(picks) == n_pairs
+    assert any(p.picked for p in picks) and any(not p.picked for p in picks)
+
+    graphs = picks_to_graphs([g], picks, min_prob=0.5)
+    edges = graphs[0].edges
+    assert edges and all(e.type == "acquires" for e in edges)
+    assert all(e.confidence == pytest.approx(0.9) for e in edges)
+    assert graphs[0].validate(BUSINESS_NEWS) == []        # legal by construction
+    assert graphs[0].mentions == g.mentions               # mentions untouched
+
+
+def test_alternatives_questions_name_the_relation():
+    wire = json.loads(msgspec.json.encode(alternatives_questions("npm", "pnpm", relation="prefers")))
+    assert wire["alternatives"]["type"] == "noul"
+    assert "prefers" in wire["alternatives"]["instructions"]
+    assert set(wire["kind"]["criteria"]) == {"alternatives", "complementary", "same", "unrelated"}
+
+
+def test_jev_alternatives_is_a_thresholded_symmetric_callable_with_a_log(client, monkeypatch):
+    asked = []
+
+    def fake_ask(state, questions, *, refresh=False):
+        asked.append((state["a"], state["b"]))
+        p = 0.9 if {state["a"], state["b"]} == {"npm", "pnpm"} else 0.1
+        return ts.SystemOneResponse(
+            model="m", usage=ts.Usage(),
+            answers={"alternatives": ts.NoulAnswer(noul=p),
+                     "kind": ts.ChoiceAnswer(choice="alternatives" if p > 0.5 else "complementary",
+                                             confidence=0.9, probabilities={})})
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    fn = JevAlternatives(client, threshold=0.5, relation="prefers")
+
+    assert fn("npm", "pnpm") is True
+    assert fn("pnpm", "npm") is True            # same answer, no second request
+    assert fn("npm", "Berlin") is False
+    assert asked == [("npm", "pnpm"), ("Berlin", "npm")]   # sorted before sending
+    assert [d["decided"] for d in fn.decisions] == [True, True, False]
+    assert fn.frame().iloc[2]["kind"] == "complementary"
+
+
+def test_jev_alternatives_plugs_into_the_temporal_graph(client, monkeypatch):
+    from kgx.temporal import Fact, TemporalGraph
+
+    def fake_ask(state, questions, *, refresh=False):
+        p = 0.95 if {state["a"], state["b"]} == {"npm", "pnpm"} else 0.05
+        return ts.SystemOneResponse(
+            model="m", usage=ts.Usage(),
+            answers={"alternatives": ts.NoulAnswer(noul=p),
+                     "kind": ts.ChoiceAnswer(choice="alternatives", confidence=1.0, probabilities={})})
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    memory = TemporalGraph(alternative_fn=JevAlternatives(client, relation="prefers"))
+
+    def fact(tail, when):
+        return Fact(head="user", relation="prefers", tail=tail, head_name="Priya", tail_name=tail,
+                    tail_type="tool", confidence=0.9, episode_id=when, valid_from=when)
+
+    memory.assert_fact(fact("npm", "2026-01-01"))
+    memory.assert_fact(fact("Python", "2026-01-02"))       # complementary: both stay current
+    killed = memory.assert_fact(fact("pnpm", "2026-02-01"))  # alternative: supersedes npm
+
+    assert [f.tail for f in killed] == ["npm"]
+    assert sorted(f.tail for f in memory.current(relation="prefers")) == ["Python", "pnpm"]
+    assert [(o.tail, n.tail) for o, n in memory.contradictions()] == [("npm", "pnpm")]
+
+
+def test_picks_to_graphs_applies_min_prob():
+    g = _pair_graph()
+    pick = RelationPick(doc_id="d1", head="m0", tail="m1", head_text="Northwind", tail_text="Cascade",
+                        head_type="company", tail_type="company", relation="acquires",
+                        confidence=0.4, probabilities={"acquires": 0.4, NO_RELATION: 0.6})
+    assert picks_to_graphs([g], [pick], min_prob=0.5)[0].edges == []
+    assert len(picks_to_graphs([g], [pick], min_prob=0.3)[0].edges) == 1

@@ -56,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,22 @@ __all__ = [
     "pair_state",
     "adjudicate_pairs",
     "apply_verdicts",
+    "TypeVerdict",
+    "type_questions",
+    "retype_mentions",
+    "apply_types",
+    "soft_typed",
+    "fold_clones",
+    "NO_RELATION",
+    "RelationPick",
+    "legal_relations",
+    "candidate_pairs",
+    "relation_questions",
+    "select_relations",
+    "picks_to_graphs",
+    "ALTERNATIVE_KINDS",
+    "alternatives_questions",
+    "JevAlternatives",
 ]
 
 DEFAULT_MODEL = "jev-latest"
@@ -144,9 +161,15 @@ class CachedTypeSafe:
         self.observed_ms = 0        # live + replayed
         self.n_observed = 0
 
-    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+    def __repr__(self) -> str:
+        # Relative to the working directory, so a notebook's printed repr does
+        # not bake the author's home directory into a committed output cell.
+        try:
+            shown = os.path.relpath(self.cache_dir)
+        except ValueError:  # pragma: no cover - different drive on Windows
+            shown = str(self.cache_dir)
         return (
-            f"CachedTypeSafe(model={self.model!r}, cache_dir={str(self.cache_dir)!r}, "
+            f"CachedTypeSafe(model={self.model!r}, cache_dir={shown!r}, "
             f"key={'set' if self.available else 'unset'})"
         )
 
@@ -662,22 +685,31 @@ class PairVerdict:
         }
 
 
-def pair_questions(type_: str) -> dict[str, Any]:
+def pair_questions(type_: str, type_description: str = "") -> dict[str, Any]:
     """The four questions asked about one candidate merge.
 
     One ``Score`` that decides, and three ``Noul`` s that explain. The diagnostics
     do not feed the decision -- they are there so a disagreement with the
     resolver can be attributed to something rather than shrugged at, which is
     the whole reason to keep raw judgments instead of just an outcome.
+
+    ``type_description`` is the ontology's annotation guideline for the type,
+    when there is one. It goes into the ``Score`` instructions, because what
+    counts as "the same product" is a domain decision -- the shopping ontology
+    says outright that ``Aurora 14`` and ``Aurora 14 Pro`` are two products --
+    and a judge that has not been told the rule can only guess at it. Left
+    empty, the question is byte-identical to the one without it, so cached
+    answers stay valid.
     """
     import typesafe_sdk as ts
 
     kind = type_ or "entity"
+    guideline = f" In this domain, a {kind} is: {type_description.strip()}" if type_description else ""
     return {
         "link_state": ts.Score(
             instructions=(
                 f"`mention_a` and `mention_b` are two mentions of a {kind}, each quoted "
-                f"with the surrounding sentence it appeared in. How do they relate?"
+                f"with the surrounding sentence it appeared in.{guideline} How do they relate?"
             ),
             criteria=LINK_LEVELS,
         ),
@@ -717,17 +749,39 @@ def pair_state(ma: Any, mb: Any) -> dict[str, Any]:
     }
 
 
+def _type_guideline(type_label: str, ontology: Any) -> str:
+    """The ontology descriptions behind a pair's type label.
+
+    A cross-type pair carries a label like ``"company or security"``; both
+    descriptions are sent, because the judge needs to know what each side was
+    taken to be.
+    """
+    if ontology is None:
+        return ""
+    parts = []
+    for name in type_label.split(" or "):
+        try:
+            desc = ontology.entity(name.strip()).description
+        except KeyError:
+            continue
+        if desc:
+            parts.append(desc.strip())
+    return " / ".join(parts)
+
+
 def adjudicate_pairs(
     client: CachedTypeSafe,
     pairs: Sequence[ScoredPair],
     mentions: Mapping[str, Any],
     *,
+    ontology: Any = None,
     refresh: bool = False,
 ) -> list[PairVerdict]:
     """Adjudicate candidate merges the resolver could not call.
 
     ``mentions`` maps ``mention_id`` to :class:`~kgx.extract.Mention`. See
-    :func:`pair_state` for what is sent.
+    :func:`pair_state` for what is sent. With ``ontology``, each pair's type
+    description is passed to :func:`pair_questions` as the guideline.
 
     One request per pair: each pair is a different state, so there is nothing to
     share. The three diagnostic questions ride along for the price of their own
@@ -736,7 +790,8 @@ def adjudicate_pairs(
     verdicts: list[PairVerdict] = []
     for pair in pairs:
         ma, mb = mentions[pair.a], mentions[pair.b]
-        response = client.ask(pair_state(ma, mb), pair_questions(pair.type), refresh=refresh)
+        questions = pair_questions(pair.type, _type_guideline(pair.type, ontology))
+        response = client.ask(pair_state(ma, mb), questions, refresh=refresh)
         score = response.scores["link_state"]
         verdicts.append(
             PairVerdict(
@@ -775,9 +830,22 @@ def apply_verdicts(
     :meth:`~kgx.resolve.Resolution.oversized` afterwards.
     """
     accept = set(accept)
-    # Union-find over canonical ids only. Mention ids never enter this map, so
-    # a mention id that happens to look like a canon id cannot collide with one.
-    parent: dict[str, str] = {cid: cid for cid in resolution.mention_to_canon.values()}
+    find, union = _union_find(resolution.mention_to_canon.values())
+    for verdict in verdicts:
+        if verdict.outcome in accept:
+            union(resolution.mention_to_canon[verdict.a], resolution.mention_to_canon[verdict.b])
+    return {mid: find(cid) for mid, cid in resolution.mention_to_canon.items()}
+
+
+def _union_find(ids: Iterable[str]):
+    """Union-find over canonical ids, with a deterministic merge direction.
+
+    Only canonical ids enter the map -- never mention ids -- so a mention id
+    that happens to look like a canon id cannot collide with one. Merging
+    always points the lexically larger root at the smaller, so the result does
+    not depend on the order the unions arrive in.
+    """
+    parent: dict[str, str] = {cid: cid for cid in ids}
 
     def find(x: str) -> str:
         root = x
@@ -787,15 +855,526 @@ def apply_verdicts(
             parent[x], x = root, parent[x]
         return root
 
-    for verdict in verdicts:
-        if verdict.outcome not in accept:
-            continue
-        ra = find(resolution.mention_to_canon[verdict.a])
-        rb = find(resolution.mention_to_canon[verdict.b])
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
         if ra != rb:
-            # Deterministic direction, so the result does not depend on the
-            # order verdicts came back in.
             lo, hi = sorted((ra, rb))
             parent[hi] = lo
 
-    return {mid: find(cid) for mid, cid in resolution.mention_to_canon.items()}
+    return find, union
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b -- typing mentions before blocking
+# ---------------------------------------------------------------------------
+#
+# Blocking in kgx.resolve is type-scoped: a `security` and a `company` are never
+# compared, whatever their strings say. Notebook 10 finds that this is where the
+# corpus's remaining recall went -- `HLCN` typed as a ticker, `Halcyon` as the
+# issuer -- and that both readings are defensible under the ontology, which
+# defines `security` to include ticker symbols.
+#
+# So the question asked here is about the REFERENT, not the expression: what
+# real-world thing does this mention stand for. And the answer kept is the
+# distribution, not the label. A ticker that comes back 0.6 security / 0.4
+# company is telling you the type is ambiguous under this ontology; the useful
+# response is to let blocking see the mention under both types and let scoring
+# decide, which is what `soft_typed` does.
+
+
+@dataclass
+class TypeVerdict:
+    """One mention, re-typed against the ontology by referent."""
+
+    mention_id: str
+    doc_id: str
+    text: str
+    extractor_type: str
+    type: str                    # the model's argmax
+    confidence: float
+    probabilities: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def changed(self) -> bool:
+        return self.type != self.extractor_type
+
+    def alternatives(self, min_prob: float = 0.25) -> list[str]:
+        """Types other than the argmax that carry at least ``min_prob``."""
+        return [
+            t for t, p in sorted(self.probabilities.items(), key=lambda kv: -kv[1])
+            if t != self.type and p >= min_prob
+        ]
+
+    def as_record(self) -> dict[str, Any]:
+        second = self.alternatives(0.0)[:1]
+        return {
+            "doc_id": self.doc_id,
+            "text": self.text,
+            "gliner": self.extractor_type,
+            "typesafe": self.type,
+            "conf": round(self.confidence, 3),
+            "runner_up": second[0] if second else "",
+            "p_runner_up": round(self.probabilities.get(second[0], 0.0), 3) if second else 0.0,
+            "changed": self.changed,
+        }
+
+
+def type_questions(text: str, ontology: Any) -> dict[str, Any]:
+    """One ``Choice`` over the ontology's entity types, for one surface form.
+
+    The criteria are the ontology's own descriptions -- the same annotation
+    guidelines GLiNER was given -- so the model and the extractor are held to
+    the same definitions. The instructions ask about the referent so that a
+    ticker, nickname or abbreviation is judged by what it stands for.
+    """
+    import typesafe_sdk as ts
+
+    return {
+        "type": ts.Choice(
+            instructions=(
+                f"In `document`, what kind of real-world thing does the mention "
+                f"“{text}” stand for? Judge the thing it refers to in this "
+                f"document, not the form of the expression: a name, nickname, "
+                f"abbreviation or ticker symbol used to talk about something stands "
+                f"for that thing."
+            ),
+            criteria={e.name: e.description for e in ontology.entities},
+        ),
+    }
+
+
+def retype_mentions(
+    client: CachedTypeSafe,
+    doc_graphs: Sequence[DocGraph],
+    ontology: Any,
+    *,
+    max_questions: int = 24,
+    refresh: bool = False,
+) -> list[TypeVerdict]:
+    """Re-type every mention by referent, one request per document per chunk.
+
+    Questions are deduplicated on surface form within a document -- the same
+    string in the same document stands for the same thing -- and the answer is
+    copied to every mention with that surface. Returns one verdict per mention.
+    """
+    verdicts: list[TypeVerdict] = []
+    for graph in doc_graphs:
+        surfaces: dict[str, list[Any]] = {}
+        for m in graph.mentions:
+            surfaces.setdefault(m.text.strip(), []).append(m)
+        order = list(surfaces)
+        for start in range(0, len(order), max_questions):
+            chunk = order[start : start + max_questions]
+            questions = {
+                f"s{start + i}": type_questions(text, ontology)["type"]
+                for i, text in enumerate(chunk)
+            }
+            response = client.ask({"document": graph.text}, questions, refresh=refresh)
+            for i, text in enumerate(chunk):
+                answer = response.choices[f"s{start + i}"]
+                for m in surfaces[text]:
+                    verdicts.append(
+                        TypeVerdict(
+                            mention_id=m.mention_id,
+                            doc_id=graph.doc_id,
+                            text=text,
+                            extractor_type=m.type,
+                            type=answer.choice,
+                            confidence=answer.confidence,
+                            probabilities=dict(answer.probabilities),
+                        )
+                    )
+    return verdicts
+
+
+def apply_types(mentions: Sequence[Any], verdicts: Sequence[TypeVerdict]) -> list[Any]:
+    """Mentions with the model's argmax type in place of the extractor's."""
+    from dataclasses import replace
+
+    by_id = {v.mention_id: v for v in verdicts}
+    return [
+        replace(m, type=by_id[m.mention_id].type) if m.mention_id in by_id else m
+        for m in mentions
+    ]
+
+
+def soft_typed(
+    mentions: Sequence[Any],
+    verdicts: Sequence[TypeVerdict],
+    *,
+    min_prob: float = 0.25,
+) -> tuple[list[Any], dict[str, str]]:
+    """Offer ambiguous mentions to blocking under every type with real mass.
+
+    Returns the argmax-typed mentions plus one *clone* per alternative type at
+    or above ``min_prob``, and a map from clone id back to the original. Clone
+    ids are ``<mention_id>~<type>``. Run the resolver over the augmented list,
+    then :func:`fold_clones` to get a clustering over the originals.
+
+    A clone enters the alternative type's block and is scored there like any
+    other mention; it does not merge with anything by itself. So this widens
+    candidate generation without touching the scoring rule -- which is exactly
+    the dial the type wall was closing.
+    """
+    from dataclasses import replace
+
+    by_id = {v.mention_id: v for v in verdicts}
+    out: list[Any] = []
+    clone_to_original: dict[str, str] = {}
+    for m in mentions:
+        v = by_id.get(m.mention_id)
+        if v is None:
+            out.append(m)
+            continue
+        out.append(replace(m, type=v.type))
+        for alt in v.alternatives(min_prob):
+            clone_id = f"{m.mention_id}~{alt}"
+            out.append(replace(m, mention_id=clone_id, type=alt))
+            clone_to_original[clone_id] = m.mention_id
+    return out, clone_to_original
+
+
+# ---------------------------------------------------------------------------
+# Stage 0b -- relation selection over enumerated entity pairs
+# ---------------------------------------------------------------------------
+#
+# System One has no spans: it cannot find an entity, and it cannot find an
+# edge. What it can do is *select*. Given two mentions the extractor already
+# found and the list of relations the ontology permits between their types, one
+# Choice picks the relation the document states -- or `none`. Code enumerates
+# the candidates; the model judges each one; nothing is generated.
+#
+# This is the "select instead of generate" pattern from the TypeSafe docs
+# applied to edges, and it is how notebook 11 asks whether a judgment model can
+# raise relation recall over joint decoding, given the same entities.
+
+NO_RELATION = "none"
+
+
+@dataclass
+class RelationPick:
+    """One candidate (head, tail) pair, with the relation the model selected."""
+
+    doc_id: str
+    head: str                # mention_id
+    tail: str                # mention_id
+    head_text: str
+    tail_text: str
+    head_type: str
+    tail_type: str
+    relation: str            # a relation name, or NO_RELATION
+    confidence: float
+    probabilities: dict[str, float] = field(default_factory=dict)
+    scope: str = ""
+
+    @property
+    def picked(self) -> bool:
+        return self.relation != NO_RELATION
+
+    @property
+    def p_relation(self) -> float:
+        """Probability of the chosen relation (0 when `none` was chosen)."""
+        return 0.0 if not self.picked else self.probabilities.get(self.relation, 0.0)
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "doc_id": self.doc_id,
+            "head": self.head_text,
+            "relation": self.relation,
+            "tail": self.tail_text,
+            "head_type": self.head_type,
+            "tail_type": self.tail_type,
+            "p": round(self.p_relation, 3),
+            "conf": round(self.confidence, 3),
+            "p_none": round(self.probabilities.get(NO_RELATION, 0.0), 3),
+        }
+
+
+def legal_relations(ontology: Any) -> dict[tuple[str, str], list[Any]]:
+    """``(head_type, tail_type) -> [RelationType, ...]`` for every legal pattern."""
+    out: dict[tuple[str, str], list[Any]] = {}
+    for rel in ontology.relations:
+        for h in rel.head:
+            for t in rel.tail:
+                out.setdefault((h, t), []).append(rel)
+    return out
+
+
+def _spans(text: str, scope: str) -> list[tuple[int, int]]:
+    """Character spans of the units candidate pairs are drawn from."""
+    if scope == "document":
+        return [(0, len(text))]
+    if scope == "paragraph":
+        pattern = r"\n\s*\n"
+    elif scope == "sentence":
+        # Crude on purpose -- "Inc." will split a sentence -- and documented as
+        # the pessimistic end of the range rather than fixed. Paragraphs are the
+        # unit the notebook actually uses.
+        pattern = r"(?<=[.!?])\s+(?=[A-Z\"“])"
+    else:
+        raise ValueError(f"scope must be document, paragraph or sentence, not {scope!r}")
+    spans, pos = [], 0
+    for m in re.finditer(pattern, text):
+        spans.append((pos, m.start()))
+        pos = m.end()
+    spans.append((pos, len(text)))
+    return spans
+
+
+def candidate_pairs(
+    graph: DocGraph, ontology: Any, *, scope: str = "paragraph"
+) -> list[tuple[Any, Any]]:
+    """Ordered mention pairs the ontology permits, co-occurring within ``scope``.
+
+    Deduplicated on ``(head surface, tail surface)`` within a document, so a
+    company named six times is asked about once per partner, not six times.
+    Both directions of a pair are separate candidates when both are legal --
+    ``supplies`` runs one way and ``subsidiary_of`` the other.
+    """
+    legal = legal_relations(ontology)
+    pairs: list[tuple[Any, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for s0, s1 in _spans(graph.text, scope):
+        inside = [m for m in graph.mentions if m.start >= s0 and m.end <= s1]
+        for a in inside:
+            for b in inside:
+                if a is b:
+                    continue
+                key = (a.text.strip(), b.text.strip())
+                if key in seen or key[0] == key[1] or (a.type, b.type) not in legal:
+                    continue
+                seen.add(key)
+                pairs.append((a, b))
+    return pairs
+
+
+def relation_questions(head_text: str, tail_text: str, relations: Sequence[Any]) -> dict[str, Any]:
+    """One ``Choice`` over the legal relations for a pair, plus ``none``.
+
+    The criteria are the ontology's relation descriptions -- the same text
+    GLiNER decodes against -- and ``none`` is always present, because the
+    docs are explicit that a question must be able to answer "nothing fits".
+    Direction is stated, since the reverse pair is a separate question.
+    """
+    import typesafe_sdk as ts
+
+    criteria = {r.name: r.description for r in relations}
+    criteria[NO_RELATION] = (
+        "The document does not relate these two things in any of the ways listed, "
+        "or relates them only in the opposite direction."
+    )
+    return {
+        "relation": ts.Choice(
+            instructions=(
+                f"In `document`, which of these relationships does the text state or "
+                f"discuss from “{head_text}” to “{tail_text}”, in that "
+                f"direction? Pick the one relationship the text supports, or none."
+            ),
+            criteria=criteria,
+        ),
+    }
+
+
+def select_relations(
+    client: CachedTypeSafe,
+    doc_graphs: Sequence[DocGraph],
+    ontology: Any,
+    *,
+    scope: str = "paragraph",
+    max_questions: int = 24,
+    refresh: bool = False,
+) -> list[RelationPick]:
+    """Ask one relation question per candidate pair, batched per document.
+
+    The document is the shared state; every question names its own pair. A
+    document with more candidates than ``max_questions`` is split into
+    several requests, as :func:`judge_edges` does.
+    """
+    legal = legal_relations(ontology)
+    picks: list[RelationPick] = []
+    for graph in doc_graphs:
+        pairs = candidate_pairs(graph, ontology, scope=scope)
+        for start in range(0, len(pairs), max_questions):
+            chunk = pairs[start : start + max_questions]
+            questions = {
+                f"p{start + i}": relation_questions(a.text, b.text, legal[(a.type, b.type)])["relation"]
+                for i, (a, b) in enumerate(chunk)
+            }
+            response = client.ask({"document": graph.text}, questions, refresh=refresh)
+            for i, (a, b) in enumerate(chunk):
+                answer = response.choices[f"p{start + i}"]
+                picks.append(
+                    RelationPick(
+                        doc_id=graph.doc_id,
+                        head=a.mention_id,
+                        tail=b.mention_id,
+                        head_text=a.text,
+                        tail_text=b.text,
+                        head_type=a.type,
+                        tail_type=b.type,
+                        relation=answer.choice,
+                        confidence=answer.confidence,
+                        probabilities=dict(answer.probabilities),
+                        scope=scope,
+                    )
+                )
+    return picks
+
+
+def picks_to_graphs(
+    doc_graphs: Sequence[DocGraph],
+    picks: Sequence[RelationPick],
+    *,
+    min_prob: float = 0.5,
+) -> list[DocGraph]:
+    """Document graphs whose edges are the selected relations.
+
+    Mentions are the extractor's, untouched; only the edges change. An edge's
+    confidence is the probability of the relation the model chose, so the
+    downstream ``min_confidence`` filters mean the same thing they do for
+    GLiNER edges. Every edge is legal by construction -- the choices were
+    drawn from :func:`legal_relations`.
+    """
+    from .extract import Edge
+
+    by_doc: dict[str, list[RelationPick]] = {}
+    for p in picks:
+        by_doc.setdefault(p.doc_id, []).append(p)
+    out: list[DocGraph] = []
+    for g in doc_graphs:
+        edges = [
+            Edge(doc_id=g.doc_id, type=p.relation, head=p.head, tail=p.tail,
+                 confidence=p.p_relation)
+            for p in by_doc.get(g.doc_id, [])
+            if p.picked and p.p_relation >= min_prob
+        ]
+        out.append(DocGraph(doc_id=g.doc_id, text=g.text, mentions=list(g.mentions),
+                            edges=edges, feasible=g.feasible, meta=dict(g.meta)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 -- deciding what contradicts what, for the temporal layer
+# ---------------------------------------------------------------------------
+#
+# kgx.temporal supersedes a `prefers`/`avoids`/`uses_tool` fact only when an
+# `alternative_fn(a, b)` says the two tails are alternatives -- and the README
+# records that embeddings cannot make that call ("npm/pnpm" and "npm/Berlin"
+# overlap under every template tried). It is a world-knowledge question, which
+# is what a System One model is for. `JevAlternatives` is that function, with
+# a log, so `TemporalGraph(alternative_fn=JevAlternatives(client))` just works.
+
+ALTERNATIVE_KINDS: dict[str, str] = {
+    "alternatives": (
+        "Two options for the same role, such that adopting one usually means giving "
+        "the other up: two package managers, two programming languages for the same "
+        "job, two CI systems."
+    ),
+    "complementary": (
+        "Different kinds of thing that are commonly held together and do not compete: "
+        "a language and a database, a tool and a city."
+    ),
+    "same": "Two names for one and the same thing.",
+    "unrelated": "Nothing to do with each other.",
+}
+
+
+def alternatives_questions(a: str, b: str, *, relation: str = "") -> dict[str, Any]:
+    """Are ``a`` and ``b`` alternatives? A ``Noul`` to decide, a ``Choice`` to explain.
+
+    The state is just the two names, because that is all
+    :meth:`kgx.temporal.TemporalGraph._conflicts` has to offer -- the decision
+    has to come from what the model knows about the things, which is the point.
+    ``relation`` (e.g. ``prefers``) is named in the instructions when known.
+    """
+    import typesafe_sdk as ts
+
+    about = f" Both are things someone might “{relation}”." if relation else ""
+    return {
+        "alternatives": ts.Noul(
+            instructions=(
+                f"Are `a` and `b` alternatives -- two options filling the same role, so "
+                f"that choosing one usually means dropping the other?{about} Answer no "
+                f"if they are different kinds of thing, or things commonly used together."
+            ),
+            criteria={
+                "true": "They compete for the same role; a person typically settles on one.",
+                "false": "They do not compete: different kinds of thing, or complementary, or the same thing.",
+            },
+        ),
+        "kind": ts.Choice(
+            instructions=f"How do `a` and `b` relate to each other?{about}",
+            criteria=ALTERNATIVE_KINDS,
+        ),
+    }
+
+
+class JevAlternatives:
+    """An ``alternative_fn`` for :class:`kgx.temporal.TemporalGraph`, backed by System One.
+
+    Callable as ``fn(a, b) -> bool``; every decision is appended to
+    ``decisions`` with the probability and the explanatory ``kind``, so the
+    supersessions the temporal layer makes can be audited afterwards. The pair
+    is sorted before it is sent, so ``(npm, pnpm)`` and ``(pnpm, npm)`` share
+    one cached answer.
+    """
+
+    def __init__(
+        self,
+        client: CachedTypeSafe,
+        *,
+        threshold: float = 0.5,
+        relation: str = "",
+    ) -> None:
+        self.client = client
+        self.threshold = threshold
+        self.relation = relation
+        self.decisions: list[dict[str, Any]] = []
+        self._memo: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def judge(self, a: str, b: str) -> dict[str, Any]:
+        key = tuple(sorted((a.strip(), b.strip())))
+        if key in self._memo:
+            return self._memo[key]
+        response = self.client.ask(
+            {"a": key[0], "b": key[1]}, alternatives_questions(key[0], key[1], relation=self.relation)
+        )
+        kind = response.choices["kind"]
+        record = {
+            "a": key[0],
+            "b": key[1],
+            "p_alternatives": response.nouls["alternatives"].noul,
+            "kind": kind.choice,
+            "kind_conf": kind.confidence,
+        }
+        self._memo[key] = record
+        return record
+
+    def __call__(self, a: str, b: str) -> bool:
+        record = self.judge(a, b)
+        decision = {**record, "decided": record["p_alternatives"] >= self.threshold}
+        self.decisions.append(decision)
+        return decision["decided"]
+
+    def frame(self):
+        import pandas as pd
+
+        return pd.DataFrame(self.decisions)
+
+
+def fold_clones(
+    mention_to_canon: Mapping[str, str], clone_to_original: Mapping[str, str]
+) -> dict[str, str]:
+    """Collapse a clustering over originals + clones to one over originals.
+
+    Wherever a clone landed in a cluster, its original joins that cluster;
+    the union is transitive, so a clone that bridged two clusters merges them.
+    """
+    find, union = _union_find(mention_to_canon.values())
+    for clone, original in clone_to_original.items():
+        if clone in mention_to_canon and original in mention_to_canon:
+            union(mention_to_canon[clone], mention_to_canon[original])
+    return {
+        mid: find(cid) for mid, cid in mention_to_canon.items()
+        if mid not in clone_to_original
+    }
