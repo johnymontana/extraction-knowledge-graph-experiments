@@ -33,7 +33,10 @@ from kgx.typesafe import (
     apply_verdicts,
     edge_questions,
     judge_edges,
+    judge_sentences,
     pair_questions,
+    pair_state,
+    sentence_questions,
 )
 
 
@@ -213,6 +216,48 @@ def test_edge_questions_carry_the_ontology_description():
     questions = edge_questions("Torrent", "supplies", "Northwind",
                                relation_description=rel.description)
     assert rel.description in str(questions["status"].instructions)
+
+
+def test_sentence_questions_name_the_denial_trap():
+    """The factual Noul must say which reading of a denial to take."""
+    wire = json.loads(msgspec.json.encode(sentence_questions()))
+    assert wire["status"]["type"] == "choice"
+    assert set(wire["status"]["criteria"]) == set(ASSERTION_LEVELS)
+    assert wire["factual"]["type"] == "noul"
+    assert "NOT" in wire["factual"]["instructions"]          # the denial warning
+    assert "denies" in wire["factual"]["criteria"]["false"]
+
+
+def test_judge_sentences_accepts_an_override(client, monkeypatch):
+    """The notebook replays the first, badly worded version through this."""
+    sent = []
+
+    def fake_ask(state, questions, *, refresh=False):
+        sent.append(questions)
+        return ts.SystemOneResponse(
+            model="m", usage=ts.Usage(),
+            answers={"status": ts.ChoiceAnswer(choice="negated", confidence=0.9,
+                                               probabilities={}),
+                     "factual": ts.NoulAnswer(noul=0.7)},
+        )
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    naive = dict(sentence_questions())
+    naive["factual"] = ts.Noul(instructions="first attempt")
+    rows = judge_sentences(client, ["a sentence"], questions=naive)
+
+    assert sent[0]["factual"].instructions == "first attempt"
+    assert rows[0]["status"] == "negated" and rows[0]["factual"] == pytest.approx(0.7)
+
+
+def test_pair_state_sends_context_by_name():
+    a = mention("m0", "company", "NWL", context="NWL reported revenue growth")
+    b = mention("m1", "security", "Northwind", context="shares of Northwind fell")
+    state = pair_state(a, b)
+    assert state == {
+        "mention_a": {"text": "NWL", "type": "company", "context": "NWL reported revenue growth"},
+        "mention_b": {"text": "Northwind", "type": "security", "context": "shares of Northwind fell"},
+    }
 
 
 def test_pair_questions_are_one_score_and_three_nouls():

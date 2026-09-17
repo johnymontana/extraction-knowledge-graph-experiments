@@ -263,11 +263,14 @@ dropped 56 of GLiNER's 170 edges — 31 the document never related at all, 25 it
 denied — and not one of the 56 was a gold triple. GLiNER's own confidence does not separate the two groups,
 because span confidence is about the decoding and not about the claim.
 
-**A yes/no question that hides a second reading gets a confident answer to the wrong one.** The same model
-caught 8 of 11 modality traps as a `Noul` and 11 of 11 as a `Choice`. Every miss is a denial — *"Management
-has no plans to divest…"* — where the sentence really does assert a fact, about an intention not to act. The
-misses come back at 0.66–0.74, not at 0.5: ambiguity in the *question* does not surface as an uncertain
-answer. Naming `negated` as its own outcome fixed it. Keep the distinction in the answer type.
+**A yes/no question that hides a second reading gets a confident answer to the wrong one.** The first
+wording of a `Noul` caught 8 of 11 modality traps; a `Choice` in the same request called 11 of 11. Every miss
+is a denial — *"Management has no plans to divest…"* — where the sentence really does assert a fact, about an
+intention not to act. The misses come back at 0.66–0.74, not at 0.5: ambiguity in the *question* does not
+surface as an uncertain answer. The `Choice` never had the problem because `negated` is one of its outcomes;
+rewording the `Noul` to say which reading to take — *a sentence saying something will NOT happen does not
+make it a fact* — took it to 11 of 11 with the controls intact. Keep the distinction in the answer type, or
+state it in the question.
 
 **A perfect judge on the wrong queue is worth exactly nothing.** Adjudicating the entity-resolution review
 band produced 28 merges, all correct, none contradicting the gold labels — and moved B-cubed by zero to four

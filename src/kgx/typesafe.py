@@ -71,11 +71,13 @@ __all__ = [
     "EdgeJudgment",
     "edge_questions",
     "judge_edges",
+    "sentence_questions",
     "judge_sentences",
     "LINK_LEVELS",
     "LINK_OUTCOMES",
     "PairVerdict",
     "pair_questions",
+    "pair_state",
     "adjudicate_pairs",
     "apply_verdicts",
 ]
@@ -527,10 +529,56 @@ def judge_edges(
     return out
 
 
+def sentence_questions() -> dict[str, Any]:
+    """The two questions asked about one sentence with no edge in view.
+
+    The ``factual`` Noul is worded the way it is because of a failure. The
+    first version asked *"can the main claim be recorded as a fact that
+    currently holds?"* -- and on a denial ("Management has no plans to divest
+    the Cascade brand") that has two readings. The divestiture is not a fact;
+    the absence of a plan is. The model took the second reading, confidently,
+    on every denial in the corpus. Notebook 10 §2.2 shows the before and after.
+
+    So the question now names the thing to judge (the relationship the sentence
+    is *about*, as a graph would record it) and names the trap. A Noul near 0.5
+    means *equally likely yes or no*; it does not mean "the question was
+    ambiguous", so ambiguity has to be removed from the question, not read off
+    the answer.
+    """
+    import typesafe_sdk as ts
+
+    return {
+        "status": ts.Choice(
+            instructions=(
+                "Does `sentence` assert its main claim as a fact, or does it "
+                "hedge, deny, project or merely propose it? Judge the modality "
+                "of the sentence, not whether the claim is plausible."
+            ),
+            criteria=ASSERTION_LEVELS,
+        ),
+        "factual": ts.Noul(
+            instructions=(
+                "If a knowledge graph recorded the relationship this sentence is "
+                "about as a plain fact, would the graph be correct? Be careful with "
+                "denials: a sentence saying something will NOT happen or is NOT "
+                "planned does not make that thing a fact."
+            ),
+            criteria={
+                "true": "Yes: the sentence asserts the relationship as true now or in the past.",
+                "false": (
+                    "No: the sentence denies it, conditions it, proposes it, forecasts "
+                    "it, or only reports that someone said it might happen."
+                ),
+            },
+        ),
+    }
+
+
 def judge_sentences(
     client: CachedTypeSafe,
     sentences: Iterable[str],
     *,
+    questions: Mapping[str, Any] | None = None,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
     """Assertion status of whole sentences, with no edge in view.
@@ -538,38 +586,16 @@ def judge_sentences(
     The focused version of the same question, used on
     :data:`kgx.data.documents.MODALITY_TRAPS`. One sentence per request, because
     each sentence is a different state.
+
+    ``questions`` overrides :func:`sentence_questions`; it must still supply a
+    ``status`` Choice and a ``factual`` Noul. The notebook uses this to replay
+    the first, badly worded version beside the current one.
     """
-    import typesafe_sdk as ts
+    questions = dict(questions) if questions is not None else sentence_questions()
 
     rows: list[dict[str, Any]] = []
     for sentence in sentences:
-        response = client.ask(
-            {"sentence": sentence},
-            {
-                "status": ts.Choice(
-                    instructions=(
-                        "Does `sentence` assert its main claim as a fact, or does it "
-                        "hedge, deny, project or merely propose it? Judge the modality "
-                        "of the sentence, not whether the claim is plausible."
-                    ),
-                    criteria=ASSERTION_LEVELS,
-                ),
-                "factual": ts.Noul(
-                    instructions=(
-                        "Can the main claim of `sentence` be recorded as a fact that "
-                        "currently holds?"
-                    ),
-                    criteria={
-                        "true": "The sentence asserts it as true now or in the past.",
-                        "false": (
-                            "The sentence denies it, conditions it, proposes it, or "
-                            "places it in the future."
-                        ),
-                    },
-                ),
-            },
-            refresh=refresh,
-        )
+        response = client.ask({"sentence": sentence}, questions, refresh=refresh)
         rows.append(
             {
                 "sentence": sentence,
@@ -677,6 +703,20 @@ def pair_questions(type_: str) -> dict[str, Any]:
     }
 
 
+def pair_state(ma: Any, mb: Any) -> dict[str, Any]:
+    """The state sent for one candidate merge: both mentions, with context.
+
+    The ``context`` window is what makes ``Apple`` / ``Apple Bank`` separable,
+    so it goes in beside the surface string rather than instead of it. Named
+    fields, not a concatenated blob, so the questions can point at
+    ``mention_a.text`` and ``mention_b.context`` by path.
+    """
+    return {
+        "mention_a": {"text": ma.text, "type": ma.type, "context": ma.context},
+        "mention_b": {"text": mb.text, "type": mb.type, "context": mb.context},
+    }
+
+
 def adjudicate_pairs(
     client: CachedTypeSafe,
     pairs: Sequence[ScoredPair],
@@ -686,9 +726,8 @@ def adjudicate_pairs(
 ) -> list[PairVerdict]:
     """Adjudicate candidate merges the resolver could not call.
 
-    ``mentions`` maps ``mention_id`` to :class:`~kgx.extract.Mention`; the
-    mention's ``context`` window is what makes ``Apple`` / ``Apple Bank``
-    separable, so it is sent rather than the bare surface string.
+    ``mentions`` maps ``mention_id`` to :class:`~kgx.extract.Mention`. See
+    :func:`pair_state` for what is sent.
 
     One request per pair: each pair is a different state, so there is nothing to
     share. The three diagnostic questions ride along for the price of their own
@@ -697,11 +736,7 @@ def adjudicate_pairs(
     verdicts: list[PairVerdict] = []
     for pair in pairs:
         ma, mb = mentions[pair.a], mentions[pair.b]
-        state = {
-            "mention_a": {"text": ma.text, "type": ma.type, "context": ma.context},
-            "mention_b": {"text": mb.text, "type": mb.type, "context": mb.context},
-        }
-        response = client.ask(state, pair_questions(pair.type), refresh=refresh)
+        response = client.ask(pair_state(ma, mb), pair_questions(pair.type), refresh=refresh)
         score = response.scores["link_state"]
         verdicts.append(
             PairVerdict(
