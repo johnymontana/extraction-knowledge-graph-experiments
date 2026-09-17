@@ -19,10 +19,15 @@ joint entity *and* relation extraction against a schema supplied at runtime, on 
 | **[07](notebooks/07_kg_framework_comparison.ipynb)** | **Frameworks compared** — SimpleKGPipeline, LLMGraphTransformer, PropertyGraphIndex on one corpus | Neo4j, `claude` CLI |
 | **[08](notebooks/08_coreference.ipynb)** | **Coreference** — four neural engines against the deterministic rules | — |
 | **[09](notebooks/09_three_domains.ipynb)** | **Three domains, no LLM** — travel, customer service and ecommerce end to end, with gazetteer linking and NVL | Neo4j |
+| **[10](notebooks/10_typesafe_system_one.ipynb)** | **Typed judgments** — TypeSafe System One for assertion gating, review-band adjudication, and judgments as graph data | `TYPESAFE_API_KEY` |
 
-No API key anywhere. Notebooks 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
-Claude Code) through `kgx.llm.ClaudeCLI`, which caches every response to disk — a re-run is free and
-byte-identical. **Notebook 09 uses no LLM at all**, by design.
+Notebooks 01–09 need no API key. 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
+Claude Code) through `kgx.llm.ClaudeCLI`; **notebook 09 uses no LLM at all**, by design.
+
+**Notebook 10 is the exception** and needs a hosted API key, `TYPESAFE_API_KEY`. It is kept separate for
+that reason: `kgx.typesafe` is not exported from `kgx`, so importing it is a deliberate act and nothing
+else in the repo acquires the dependency. Like `kgx.llm.ClaudeCLI`, it caches every response to disk
+content-addressed on `(model, state, questions)` — a re-run is free, byte-identical, and needs no key.
 
 ---
 
@@ -34,7 +39,7 @@ uv run jupyter lab notebooks/01_gliner25_knowledge_graphs.ipynb
 ```
 
 First run downloads ~400 MB (GLiNER2.5-base) plus ~90 MB (MiniLM, for entity resolution). Everything after
-that is local. No API keys anywhere in this repo.
+that is local; the only hosted dependency in the repo is notebook 10's.
 
 ```python
 import kgx
@@ -68,6 +73,7 @@ ontology  →  extract  →  [coref]  →  resolve  →  graph  →  [temporal]
 | `kgx.temporal` | Bi-temporal fact store — supersede contradictions instead of accumulating them. |
 | `kgx.neo4j_io` | Idempotent loading into Neo4j via `$()` dynamic labels, with schema introspection. |
 | `kgx.llm` | The `claude` CLI as a cached LLM backend, plus an `LLMExtractor` that returns the same `DocGraph` as GLiNER. |
+| `kgx.typesafe` | TypeSafe System One as a pipeline stage — a disk-cached client, assertion gating on extracted edges, and adjudication of the resolution review band. The one module that needs a hosted API key. |
 | `kgx.evaluate` | Triple-level P/R/F1 with an explicit, auditable matching policy. |
 | `kgx.baselines` | spaCy as the closed-vocabulary floor, with the ontology-coverage gap made explicit. |
 | `kgx.frameworks` | Adapters so LangChain / LlamaIndex / graphrag can run on a subprocess-backed LLM. |
@@ -147,13 +153,14 @@ src/kgx/            the library
   temporal.py       bi-temporal facts, supersession
   neo4j_io.py       idempotent Neo4j loading, schema introspection
   llm.py            cached claude-CLI backend + LLM extractor
+  typesafe.py       cached TypeSafe System One client; edge gating + pair adjudication
   evaluate.py       triple scoring against gold
   baselines.py      spaCy closed-vocab baseline
   frameworks.py     LangChain / LlamaIndex / graphrag adapters
   gazetteer.py      controlled-vocabulary entity linking
   domains.py        travel / customer service / shopping ontologies
   data/             synthetic corpora with gold labels
-notebooks/          01-08, see the table above
+notebooks/          01-10, see the table above
 docs/LANDSCAPE.md   survey of the alternatives at every stage
 output/             generated graphs, Cypher, CSVs (gitignored)
 ```
@@ -247,6 +254,45 @@ on. Of every task in notebook 09, that is the one worth escalating.
 **An ontology is a hypothesis about the text.** `replaces` fires at 0.99 on agent memory ("I've switched to
 pnpm" — one clause, two named tools, an explicit verb) and never fires on support threads, where the same
 supersession is spread across a four-turn negotiation. Same relation, same model, different discourse shape.
+
+**More findings, from the typed-judgment notebook:**
+
+**An assertion gate raised precision 0.279 → 0.404 and did not cost a single point of recall** (notebook
+10). A `Noul` for *does the document connect these two things* plus a `Choice` over four assertion statuses
+dropped 56 of GLiNER's 170 edges — 31 the document never related at all, 25 it related and then hedged or
+denied — and not one of the 56 was a gold triple. GLiNER's own confidence does not separate the two groups,
+because span confidence is about the decoding and not about the claim.
+
+**A yes/no question that hides a second reading gets a confident answer to the wrong one.** The same model
+caught 8 of 11 modality traps as a `Noul` and 11 of 11 as a `Choice`. Every miss is a denial — *"Management
+has no plans to divest…"* — where the sentence really does assert a fact, about an intention not to act. The
+misses come back at 0.66–0.74, not at 0.5: ambiguity in the *question* does not surface as an uncertain
+answer. Naming `negated` as its own outcome fixed it. Keep the distinction in the answer type.
+
+**A perfect judge on the wrong queue is worth exactly nothing.** Adjudicating the entity-resolution review
+band produced 28 merges, all correct, none contradicting the gold labels — and moved B-cubed by zero to four
+decimal places. All 28 were already co-clustered by transitivity, and the 10 merges that did change
+clusters were on mentions outside the gold set. This is notebook 05's finding with the scoring hypothesis
+eliminated: the judge was flawless and it still bought nothing.
+
+**The pairs it never saw were a type disagreement, not a string-similarity failure.** 41 gold-same pairs
+stayed split and *none had ever been proposed* — `HLCN` against every spelling of Halcyon, and `Torrent
+Microsystems` against itself. The extractor types `HLCN` as `security` and `Halcyon Semiconductor` as
+`company`, and types the identical string `Torrent Microsystems` both ways in different documents; blocking
+is type-scoped, so none of it is ever a candidate. Handed those 8 pairs directly, the same adjudicator
+reaches **B-cubed F1 1.000 at precision 1.000** — where notebook 05's best configurations also land, from
+the opposite direction. The type constraint in notebook 09's gazetteer cost 20 points of coverage; here it
+cost the entire remaining recall gap.
+
+**`pair_completeness` is not a ceiling on B-cubed recall.** 0.879 against a baseline recall of 0.897 and a
+recovered recall of 1.000. Clustering is transitive, so it unites pairs blocking never proposed. What it
+bounds is what an adjudicator can be *asked* about — which is the constraint that actually bit.
+
+**Batching is a property of the state, not a flag.** 627 questions in 98 requests at ~180 ms each; edge
+gating alone was 340 questions in 35, because one request carries a dozen edges over one shared document.
+One question per request would re-send each document 34 times — ~128k tokens of document text against
+~6.8k. The cost is paid in how the questions are written: every question in a request sees the same state
+and question ids are never sent to the model, so each has to name its own edge.
 
 ## Notes
 
