@@ -24,14 +24,19 @@ joint entity *and* relation extraction against a schema supplied at runtime, on 
 | **[12](notebooks/12_typesafe_contradictions.ipynb)** | **What contradicts what** — a `Noul` as the temporal layer's `alternative_fn`, against embeddings and `replaces` edges, on the planted switches | `TYPESAFE_API_KEY` |
 | **[13](notebooks/13_typesafe_cascade.ipynb)** | **Escalate on confidence** — the uncertain edge judgments and `review` pairs sent to Claude Haiku, swept from 0% to 100%, with cost | `TYPESAFE_API_KEY`, `claude` CLI |
 | **[14](notebooks/14_typesafe_document_judgments.ipynb)** | **The boundary of the no-LLM position** — intent, priority and resolution for the eight support threads, as three questions and then as graph properties | `TYPESAFE_API_KEY` |
+| **[15](notebooks/15_gliner_decide.ipynb)** | **Propose, then decide** — GLiNER2.5-Decide checking GLiNER2.5's edges and typing its mentions against the same ontology, the must-not-merge traps, and the judgments loaded into Neo4j as properties | Neo4j (§5 only) |
 
-Notebooks 01–09 need no API key. 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
+Notebooks 01–09 and 15 need no API key. 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
 Claude Code) through `kgx.llm.ClaudeCLI`; **notebook 09 uses no LLM at all**, by design.
 
 **Notebooks 10–14 are the exception** and need a hosted API key, `TYPESAFE_API_KEY` (13 also needs the
 `claude` CLI). They are kept separate for that reason: `kgx.typesafe` is not exported from `kgx`, so
 importing it is a deliberate act and nothing else in the repo acquires the dependency. Like `kgx.llm.ClaudeCLI`, it caches every response to disk
 content-addressed on `(model, state, questions)` — a re-run is free, byte-identical, and needs no key.
+
+**Notebook 15 asks notebook 10's questions locally**, with
+[GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide), the classification model in the GLiNER2.5
+family, through `kgx.decide`. It needs no key and no cache, and its measured bar is notebook 10's.
 
 ---
 
@@ -42,8 +47,9 @@ uv sync
 uv run jupyter lab notebooks/01_gliner25_knowledge_graphs.ipynb
 ```
 
-First run downloads ~400 MB (GLiNER2.5-base) plus ~90 MB (MiniLM, for entity resolution). Everything after
-that is local; the only hosted dependency in the repo is notebooks 10–14's.
+First run downloads ~400 MB (GLiNER2.5-base) plus ~90 MB (MiniLM, for entity resolution); notebook 15 adds
+~1.9 GB (GLiNER2.5-Decide, a DeBERTa-v3-large). Everything after that is local; the only hosted dependency in
+the repo is notebooks 10–14's.
 
 ```python
 import kgx
@@ -78,6 +84,7 @@ ontology  →  extract  →  [coref]  →  resolve  →  graph  →  [temporal]
 | `kgx.neo4j_io` | Idempotent loading into Neo4j via `$()` dynamic labels, with schema introspection. |
 | `kgx.llm` | The `claude` CLI as a cached LLM backend, plus an `LLMExtractor` that returns the same `DocGraph` as GLiNER. |
 | `kgx.typesafe` | TypeSafe System One as a pipeline stage — a disk-cached client; assertion gating, pair adjudication, referent typing and soft blocking, relation selection over enumerated pairs, and an `alternative_fn` for the temporal layer. The one module that needs a hosted API key. |
+| `kgx.decide` | GLiNER2.5-Decide as a pipeline stage — edge checks (sentence modality, and whether Decide picks the same legal relation GLiNER decoded), context-free typing as a second opinion for blocking, and the selection and pair-matching experiments it fails. Local, no key. |
 | `kgx.evaluate` | Triple-level P/R/F1 with an explicit, auditable matching policy. |
 | `kgx.baselines` | spaCy as the closed-vocabulary floor, with the ontology-coverage gap made explicit. |
 | `kgx.frameworks` | Adapters so LangChain / LlamaIndex / graphrag can run on a subprocess-backed LLM. |
@@ -135,6 +142,13 @@ under every template tried. Asking the extractor to classify tools into categori
 work: declare `replaces(tool → tool)` in the ontology and let joint decoding find the switch the user
 announced in the text. Extracted at 0.99 confidence, with the sentence attached.
 
+**A classifier checks what an extractor proposes, and cannot do the proposing.** GLiNER2.5-Decide, asked two
+questions per extracted edge — is its sentence a *fact*, and would it pick the same relation from the ontology's
+legal ones — lifts gold-triple F1 0.330 → 0.396 at no recall cost, near the hosted gate's 0.404; as a second
+type for blocking it takes resolution to B-cubed 1.000. Asked to *find* relations among co-occurring pairs, or
+to decide whether two mentions are one entity, it fails. And the wording that works is its own: short concept
+labels, the span as the whole text, and a task name chosen for meaning, because the name is part of the prompt.
+
 **Errors move between stages wearing a disguise.** A mistyped entity in extraction and an under-merge in
 resolution both surface as "the user changed their mind" in the temporal layer. A subject that flip-flops
 back to a value it already held is the tell. Carrying evidence on every edge is what makes them separable.
@@ -158,13 +172,14 @@ src/kgx/            the library
   neo4j_io.py       idempotent Neo4j loading, schema introspection
   llm.py            cached claude-CLI backend + LLM extractor
   typesafe.py       cached TypeSafe System One client; edge gating + pair adjudication
+  decide.py         GLiNER2.5-Decide edge checks + typing ahead of blocking (local)
   evaluate.py       triple scoring against gold
   baselines.py      spaCy closed-vocab baseline
   frameworks.py     LangChain / LlamaIndex / graphrag adapters
   gazetteer.py      controlled-vocabulary entity linking
   domains.py        travel / customer service / shopping ontologies
   data/             synthetic corpora with gold labels
-notebooks/          01-14, see the table above
+notebooks/          01-15, see the table above
 docs/LANDSCAPE.md   survey of the alternatives at every stage
 output/             generated graphs, Cypher, CSVs (gitignored)
 ```
