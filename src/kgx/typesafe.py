@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .env import getenv
 from .extract import DocGraph
 from .resolve import Resolution, ScoredPair
 
@@ -125,7 +126,8 @@ class CachedTypeSafe:
         calls. Defaults to ``output/typesafe_cache`` (gitignored, like the LLM
         cache).
     api_key:
-        Falls back to ``TYPESAFE_API_KEY``. The client is constructed lazily, so
+        Falls back to ``TYPESAFE_API_KEY`` in the environment, then in the
+        repo-root ``.env`` (:func:`kgx.env.getenv`). The client is constructed lazily, so
         a fully-cached notebook runs with no key set at all.
 
     Counters mirror :class:`kgx.llm.ClaudeCLI`: ``total_ms`` is wall time this
@@ -145,7 +147,7 @@ class CachedTypeSafe:
         self.model = model
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
+        self._api_key = api_key or getenv("TYPESAFE_API_KEY")
         self.timeout = timeout
         self.max_retries = max_retries
         self._client: Any = None
@@ -184,7 +186,8 @@ class CachedTypeSafe:
         """Raise unless the API is usable; return the model names it offers."""
         if not self.available:
             raise TypeSafeUnavailable(
-                "TYPESAFE_API_KEY is not set. Get one at https://console.typesafe.ai/, "
+                "TYPESAFE_API_KEY is not set (environment or .env). "
+                "Get one at https://console.typesafe.ai/, "
                 "or point cache_dir at a directory with cached responses to replay them."
             )
         return [m.name for m in self._ensure_client().models.list().models]
