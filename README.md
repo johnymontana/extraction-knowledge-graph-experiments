@@ -25,18 +25,24 @@ joint entity *and* relation extraction against a schema supplied at runtime, on 
 | **[13](notebooks/13_typesafe_cascade.ipynb)** | **Escalate on confidence** — the uncertain edge judgments and `review` pairs sent to Claude Haiku, swept from 0% to 100%, with cost | `TYPESAFE_API_KEY`, `claude` CLI |
 | **[14](notebooks/14_typesafe_document_judgments.ipynb)** | **The boundary of the no-LLM position** — intent, priority and resolution for the eight support threads, as three questions and then as graph properties | `TYPESAFE_API_KEY` |
 | **[15](notebooks/15_gliner_decide.ipynb)** | **Propose, then decide** — GLiNER2.5-Decide checking GLiNER2.5's edges and typing its mentions against the same ontology, the must-not-merge traps, and the judgments loaded into Neo4j as properties | Neo4j (§5 only) |
+| **[16](notebooks/16_decide_entity_alignment.ipynb)** | **The alignment cookbook, locally** — TypeSafe's entity-alignment recipe (450 Magellan Beer pairs, one `Score` + three `Noul`s, routed with no fitted threshold) reproduced with GLiNER2.5-Decide in place of Jev, then both models scored against the benchmark's labels | `TYPESAFE_API_KEY` or its cache (§6 only) |
 
-Notebooks 01–09 and 15 need no API key. 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
+Notebooks 01–09, 15 and 16 need no API key (16's Jev section excepted; it skips itself without one). 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
 Claude Code) through `kgx.llm.ClaudeCLI`; **notebook 09 uses no LLM at all**, by design.
 
 **Notebooks 10–14 are the exception** and need a hosted API key, `TYPESAFE_API_KEY` (13 also needs the
-`claude` CLI). They are kept separate for that reason: `kgx.typesafe` is not exported from `kgx`, so
+`claude` CLI). Export it, or copy `.env.example` to `.env` (gitignored) and fill it in; `kgx.env.getenv`
+reads the environment first and `.env` second. They are kept separate for that reason: `kgx.typesafe` is not exported from `kgx`, so
 importing it is a deliberate act and nothing else in the repo acquires the dependency. Like `kgx.llm.ClaudeCLI`, it caches every response to disk
 content-addressed on `(model, state, questions)` — a re-run is free, byte-identical, and needs no key.
 
 **Notebook 15 asks notebook 10's questions locally**, with
 [GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide), the classification model in the GLiNER2.5
 family, through `kgx.decide`. It needs no key and no cache, and its measured bar is notebook 10's.
+**Notebook 16 does the same for a published TypeSafe cookbook**, [entity
+alignment](https://docs.typesafe.ai/cookbooks/entity_alignment), on the cookbook's own 450 benchmark pairs
+under the same ids (`kgx.data.beer` downloads them once into `output/beer/`), and then runs Jev itself on
+every pair so both models are scored against the benchmark's labels.
 
 ---
 
@@ -48,7 +54,7 @@ uv run jupyter lab notebooks/01_gliner25_knowledge_graphs.ipynb
 ```
 
 First run downloads ~400 MB (GLiNER2.5-base) plus ~90 MB (MiniLM, for entity resolution); notebook 15 adds
-~1.9 GB (GLiNER2.5-Decide, a DeBERTa-v3-large). Everything after that is local; the only hosted dependency in
+~1.9 GB (GLiNER2.5-Decide, a DeBERTa-v3-large), which notebook 16 reuses. Everything after that is local; the only hosted dependency in
 the repo is notebooks 10–14's.
 
 ```python
@@ -149,6 +155,17 @@ type for blocking it takes resolution to B-cubed 1.000. Asked to *find* relation
 to decide whether two mentions are one entity, it fails. And the wording that works is its own: short concept
 labels, the span as the whole text, and a task name chosen for meaning, because the name is part of the prompt.
 
+**"No threshold to fit" belongs to the model, not the recipe.** TypeSafe's entity-alignment cookbook routes
+450 Magellan Beer pairs by rounding one `Score` to the nearest of three worded levels (Jev: 40 merged, 50 to
+a curator, 360 unlinked, as published). Asked the same four questions, GLiNER2.5-Decide sends **all 450 to the curator**:
+its distribution over the levels is nearly flat on every pair, and it answers *no* to "same beer name?" on
+all twelve pairs whose names are identical. Its P(same) still *orders* the pairs (AUC 0.87 against the
+benchmark's labels), so cut points fitted on the train split can route. But they sit about two hundredths
+apart, make false merges when the wording changes, and a one-line string ratio on the names orders the pairs
+better (0.951). Jev, re-run on every pair (`jev-latest`, now 1.13.0; 1.12 is no longer served), merges 39 —
+**every one a match, with no threshold fitted** — hands the curator 38, and leaves 4 of the 68 matches
+unlinked, each a pair naming two different breweries. Its score orders the pairs at AUC 0.992.
+
 **Errors move between stages wearing a disguise.** A mistyped entity in extraction and an under-merge in
 resolution both surface as "the user changed their mind" in the temporal layer. A subject that flip-flops
 back to a value it already held is the tell. Carrying evidence on every edge is what makes them separable.
@@ -172,14 +189,16 @@ src/kgx/            the library
   neo4j_io.py       idempotent Neo4j loading, schema introspection
   llm.py            cached claude-CLI backend + LLM extractor
   typesafe.py       cached TypeSafe System One client; edge gating + pair adjudication
+  env.py            TYPESAFE_API_KEY and friends: environment first, then .env
   decide.py         GLiNER2.5-Decide edge checks + typing ahead of blocking (local)
+  alignment.py      the entity-alignment cookbook's decision, asked of Decide; AUC + fitted cuts
   evaluate.py       triple scoring against gold
   baselines.py      spaCy closed-vocab baseline
   frameworks.py     LangChain / LlamaIndex / graphrag adapters
   gazetteer.py      controlled-vocabulary entity linking
   domains.py        travel / customer service / shopping ontologies
-  data/             synthetic corpora with gold labels
-notebooks/          01-15, see the table above
+  data/             synthetic corpora with gold labels; beer.py fetches Magellan Beer
+notebooks/          01-16, see the table above
 docs/LANDSCAPE.md   survey of the alternatives at every stage
 output/             generated graphs, Cypher, CSVs (gitignored)
 ```
