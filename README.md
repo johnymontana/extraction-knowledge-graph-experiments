@@ -26,9 +26,10 @@ joint entity *and* relation extraction against a schema supplied at runtime, on 
 | **[14](notebooks/14_typesafe_document_judgments.ipynb)** | **The boundary of the no-LLM position** — intent, priority and resolution for the eight support threads, as three questions and then as graph properties | `TYPESAFE_API_KEY` |
 | **[15](notebooks/15_gliner_decide.ipynb)** | **Propose, then decide** — GLiNER2.5-Decide checking GLiNER2.5's edges and typing its mentions against the same ontology, the must-not-merge traps, and the judgments loaded into Neo4j as properties | Neo4j (§5 only) |
 | **[16](notebooks/16_decide_entity_alignment.ipynb)** | **The alignment cookbook, locally** — TypeSafe's entity-alignment recipe (450 Magellan Beer pairs, one `Score` + three `Noul`s, routed with no fitted threshold) reproduced with GLiNER2.5-Decide in place of Jev, then both models scored against the benchmark's labels | `TYPESAFE_API_KEY` or its cache (§6 only) |
+| **[17](notebooks/17_neo4j_graphrag_gliner.ipynb)** | **GLiNER2.5 inside neo4j-graphrag** — the package's KG pipeline with a GLiNER2.5 extractor component in the LLM's slot, every resolver it ships measured against gold and against what gold cannot see, and a mention-level resolver that keeps names, aliases and edge support | Neo4j + APOC (§4 on) |
 
-Notebooks 01–09, 15 and 16 need no API key (16's Jev section excepted; it skips itself without one). 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
-Claude Code) through `kgx.llm.ClaudeCLI`; **notebook 09 uses no LLM at all**, by design.
+Notebooks 01–09 and 15–17 need no API key (16's Jev section excepted; it skips itself without one). 03, 05, 06 and 07 use the `claude` CLI (already authenticated if you use
+Claude Code) through `kgx.llm.ClaudeCLI`; **notebooks 09 and 17 use no LLM at all**, by design.
 
 **Notebooks 10–14 are the exception** and need a hosted API key, `TYPESAFE_API_KEY` (13 also needs the
 `claude` CLI). Export it, or copy `.env.example` to `.env` (gitignored) and fill it in; `kgx.env.getenv`
@@ -43,6 +44,12 @@ family, through `kgx.decide`. It needs no key and no cache, and its measured bar
 alignment](https://docs.typesafe.ai/cookbooks/entity_alignment), on the cookbook's own 450 benchmark pairs
 under the same ids (`kgx.data.beer` downloads them once into `output/beer/`), and then runs Jev itself on
 every pair so both models are scored against the benchmark's labels.
+
+**Notebook 17 answers notebook 07's open question**, whether neo4j-graphrag's pipeline can run without an
+LLM and with a real resolver. `kgx.graphrag.GlinerEntityRelationExtractor` is an `EntityRelationExtractor`
+that decodes each chunk against the pipeline's own `GraphSchema`, so the package's splitter, chunk embedder,
+pruner, writer, resolvers and retrievers run on GLiNER2.5 output unchanged. It needs neo4j-graphrag ≥ 1.19,
+where the components moved out of `experimental`.
 
 ---
 
@@ -91,6 +98,7 @@ ontology  →  extract  →  [coref]  →  resolve  →  graph  →  [temporal]
 | `kgx.llm` | The `claude` CLI as a cached LLM backend, plus an `LLMExtractor` that returns the same `DocGraph` as GLiNER. |
 | `kgx.typesafe` | TypeSafe System One as a pipeline stage — a disk-cached client; assertion gating, pair adjudication, referent typing and soft blocking, relation selection over enumerated pairs, and an `alternative_fn` for the temporal layer. The one module that needs a hosted API key. |
 | `kgx.decide` | GLiNER2.5-Decide as a pipeline stage — edge checks (sentence modality, and whether Decide picks the same legal relation GLiNER decoded), context-free typing as a second opinion for blocking, and the selection and pair-matching experiments it fails. Local, no key. |
+| `kgx.graphrag` | GLiNER2.5 as a neo4j-graphrag component — an `EntityRelationExtractor` for the package's `Pipeline`, `Ontology` → `GraphSchema`, a transitive `FuzzyMatchResolver`, and `KgxResolver`: `kgx.EntityResolver` over a `:Mention` layer, keeping canonical names, aliases and edge support through APOC merges. No LLM. |
 | `kgx.evaluate` | Triple-level P/R/F1 with an explicit, auditable matching policy. |
 | `kgx.baselines` | spaCy as the closed-vocabulary floor, with the ontology-coverage gap made explicit. |
 | `kgx.frameworks` | Adapters so LangChain / LlamaIndex / graphrag can run on a subprocess-backed LLM. |
@@ -192,13 +200,14 @@ src/kgx/            the library
   env.py            TYPESAFE_API_KEY and friends: environment first, then .env
   decide.py         GLiNER2.5-Decide edge checks + typing ahead of blocking (local)
   alignment.py      the entity-alignment cookbook's decision, asked of Decide; AUC + fitted cuts
+  graphrag.py       GLiNER2.5 extractor + mention-level resolver as neo4j-graphrag components
   evaluate.py       triple scoring against gold
   baselines.py      spaCy closed-vocab baseline
   frameworks.py     LangChain / LlamaIndex / graphrag adapters
   gazetteer.py      controlled-vocabulary entity linking
   domains.py        travel / customer service / shopping ontologies
   data/             synthetic corpora with gold labels; beer.py fetches Magellan Beer
-notebooks/          01-16, see the table above
+notebooks/          01-17, see the table above
 docs/LANDSCAPE.md   survey of the alternatives at every stage
 output/             generated graphs, Cypher, CSVs (gitignored)
 ```
@@ -212,7 +221,9 @@ events are fictional.
 
 Notebook 02 needs a Neo4j 5.26+ instance. Nothing else — the embeddings are a local MiniLM and the two
 retrievers that genuinely need an LLM run against a deterministic stub (with a live path if
-`ANTHROPIC_API_KEY` is set).
+`ANTHROPIC_API_KEY` is set). Notebook 17 also needs APOC, which neo4j-graphrag's writer and resolvers call
+and `neo4j_up.sh` installs. It writes only under the `:__KGBuilder__` label, and leaves its graph in place
+for browsing.
 
 ```bash
 scripts/neo4j_up.sh          # docker if available, a local tarball under .neo4j/ if not
@@ -393,6 +404,46 @@ gating alone was 340 questions in 35, because one request carries a dozen edges 
 One question per request would re-send each document 34 times — ~128k tokens of document text against
 ~6.8k. The cost is paid in how the questions are written: every question in a request sees the same state
 and question ids are never sent to the model, so each has to name its own edge.
+
+**More findings, from the neo4j-graphrag notebook:**
+
+**The extractor slot is the only place neo4j-graphrag needs an LLM** (notebook 17). A GLiNER2.5
+`EntityRelationExtractor` reproduces notebook 01's extraction exactly (214 mentions, 170 relations), and the
+package's own pipeline around it — splitter, MiniLM chunk embedder, pruner, writer, resolver — reproduces the
+hand-built numbers exactly: B-cubed 0.946 and gold-triple F1 0.330, ten documents in about nine seconds on a
+laptop CPU. `GraphPruning` prunes nothing, because joint decoding cannot emit an edge the schema forbids.
+The one thing it *will* prune is your properties. A node type that declares any properties defaults to
+`additional_properties=False`, and a name-only schema silently strips `confidence` and the offsets from all
+214 nodes.
+
+**`FixedSizeSplitter`'s default is past GLiNER's cliff.** 4,000 characters is ~600 words. On the corpus as
+one long document it cost a sixth of relation recall and a third of the *mentions* (115 against 180 at 2,500
+characters). It is neither truncation nor `top_k_entities`. Size chunks in words, under ~400.
+
+**The package's resolvers deduplicate; they do not canonicalise.** All three merge with
+`apoc.refactor.mergeNodes(..., {properties: 'discard'})`, and the similarity resolvers pass the nodes as
+`list(set_of_element_ids)`. So the surviving `name` — and the surviving edge `confidence` — is set order over
+element ids, and changes between identical runs: Halcyon came out as `Halcyon`, `Halcyon Semiconductor` or
+`Halcyon Semiconductor Corporation`. Strict triple F1 swings with the name on an identical clustering. No alias and no
+edge support survives. `SimpleKGPipeline`'s default resolver is an exact match (B-cubed 0.779 here); the
+fuzzy one reaches 0.898.
+
+**Gold labels certify the fuzzy resolver, and triple scores reward it.** `FuzzyMatchResolver` at 0.9 has
+B-cubed precision 1.000 on the 13 gold entities while merging `Phoenix` into `Arizona`, `Dresden` into
+`Germany` and every margin into one metric — mentions no gold label covers. `WRatio`'s partial matching
+scores containment at 90. spaCy's static vectors merge `Seattle` with `Chicago`. And the over-merges *raise*
+triple precision, because collapsed places mean fewer triples.
+
+**Resolve mentions, not nodes.** A resolver that compares nodes sees one surviving name per merged node.
+Run per document, as `SimpleKGPipeline` runs it, the repo's resolver pointed at nodes drops from 0.946 to
+about 0.92 B-cubed. Keeping a `:Mention` per span (its own `HAS_MENTION`, which survives `mergeRels`, where
+`FROM_CHUNK` collapses) and clustering mentions on every run gives the same answer per document as once.
+It is also what makes aliases, edge support and every merge auditable.
+
+**Two latent bugs, neither biting this corpus.** `_consolidate_sets` is one pass, not a union-find:
+`{a,b}, {c,d}, {b,c}` becomes two overlapping merge sets, and on a scripted probe the real `run()` left two
+nodes instead of one on some runs and not others. And a node's every label except `__Entity__`/`__KGBuilder__` is
+treated as a type, so a partition label makes each node resolved twice.
 
 ## Notes
 
